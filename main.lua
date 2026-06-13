@@ -542,6 +542,257 @@ function DictSync:saveWordToSupabase(word_data)
 end
 
 -- ============================================
+-- TEXTS: SUPABASE OPERATIONS
+-- ============================================
+
+-- Check whether a text with this title already exists
+function DictSync:checkTextExists(title)
+    if not self.settings then return nil, "Settings not initialized" end
+
+    local supabase_url = self.settings:readSetting("supabase_url")
+    local supabase_key = self.settings:readSetting("supabase_key")
+
+    if not supabase_url or not supabase_key then
+        return nil, "Supabase credentials not configured"
+    end
+
+    local url = string.format("%s/rest/v1/texts?title=eq.%s&deleted_at=is.null",
+        supabase_url,
+        self:urlEncode(title)
+    )
+
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local response_body = {}
+
+    local success, result, status_code, headers = pcall(function()
+        return http.request({
+            url = url,
+            method = "GET",
+            headers = {
+                ["apikey"] = supabase_key,
+                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Content-Type"] = "application/json",
+            },
+            sink = ltn12.sink.table(response_body),
+            timeout = 10,
+        })
+    end)
+
+    if not success then
+        return nil, "Network error: " .. tostring(result)
+    end
+
+    if status_code == 200 then
+        local json = require("json")
+        local success_decode, data = pcall(function()
+            return json.decode(table.concat(response_body))
+        end)
+        if success_decode and data and #data > 0 then
+            return data[1], nil
+        end
+        return nil, nil
+    elseif status_code == 401 or status_code == 403 then
+        return nil, "Authentication failed. Please check your API key."
+    else
+        return nil, "HTTP " .. tostring(status_code) .. ": " .. table.concat(response_body)
+    end
+end
+
+-- Save a text (current chapter) to Supabase. Updates an existing koreader text
+-- with the same title, otherwise inserts a new row.
+function DictSync:saveTextToSupabase(text_data)
+    if not self.settings then return false, "Settings not initialized" end
+
+    local supabase_url = self.settings:readSetting("supabase_url")
+    local supabase_key = self.settings:readSetting("supabase_key")
+
+    if not supabase_url or not supabase_key then
+        return false, "Supabase credentials not configured"
+    end
+
+    if not text_data.title or text_data.title == "" then
+        return false, "Cannot save text without a title"
+    end
+    if not text_data.text or text_data.text == "" then
+        return false, "Cannot save an empty text"
+    end
+
+    local payload = {
+        title = text_data.title,
+        text = text_data.text,
+    }
+    if text_data.language then
+        payload.language = text_data.language
+    end
+
+    local json = require("json")
+    local payload_json = json.encode(payload)
+
+    -- Check if a text with this title already exists
+    local existing_text, error_msg = self:checkTextExists(text_data.title)
+    if error_msg then
+        return false, "Error checking for existing text: " .. error_msg
+    end
+
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local response_body = {}
+
+    if existing_text then
+        -- Update existing text
+        local url = string.format("%s/rest/v1/texts?id=eq.%d",
+            supabase_url,
+            existing_text.id
+        )
+
+        local success, result, status_code, headers = pcall(function()
+            return http.request({
+                url = url,
+                method = "PATCH",
+                headers = {
+                    ["apikey"] = supabase_key,
+                    ["Authorization"] = "Bearer " .. supabase_key,
+                    ["Content-Type"] = "application/json",
+                    ["Prefer"] = "return=representation",
+                },
+                source = ltn12.source.string(payload_json),
+                sink = ltn12.sink.table(response_body),
+                timeout = 10,
+            })
+        end)
+
+        if not success then
+            return false, "Network error: " .. tostring(result)
+        end
+
+        if status_code == 200 or status_code == 204 then
+            return true, "Text updated successfully"
+        elseif status_code == 401 or status_code == 403 then
+            return false, "Authentication failed. Please check your API key."
+        else
+            return false, "HTTP " .. tostring(status_code) .. ": " .. table.concat(response_body)
+        end
+    else
+        -- Insert new text
+        local url = string.format("%s/rest/v1/texts", supabase_url)
+
+        local success, result, status_code, headers = pcall(function()
+            return http.request({
+                url = url,
+                method = "POST",
+                headers = {
+                    ["apikey"] = supabase_key,
+                    ["Authorization"] = "Bearer " .. supabase_key,
+                    ["Content-Type"] = "application/json",
+                    ["Prefer"] = "return=representation",
+                },
+                source = ltn12.source.string(payload_json),
+                sink = ltn12.sink.table(response_body),
+                timeout = 10,
+            })
+        end)
+
+        if not success then
+            return false, "Network error: " .. tostring(result)
+        end
+
+        if status_code == 201 or status_code == 200 then
+            return true, "Text saved successfully"
+        elseif status_code == 401 or status_code == 403 then
+            return false, "Authentication failed. Please check your API key."
+        else
+            local err = table.concat(response_body)
+            local success_decode, error_data = pcall(function()
+                return json.decode(err)
+            end)
+            if success_decode and error_data and error_data.message then
+                return false, "Error: " .. error_data.message
+            end
+            return false, "HTTP " .. tostring(status_code) .. ": " .. err
+        end
+    end
+end
+
+-- Fetch texts from Supabase with pagination (excludes soft-deleted rows)
+function DictSync:fetchTextsFromSupabase(page, page_size)
+    page = page or 1
+    page_size = page_size or 25
+
+    if not self.settings then return nil, "Settings not initialized" end
+
+    local supabase_url = self.settings:readSetting("supabase_url")
+    local supabase_key = self.settings:readSetting("supabase_key")
+
+    if not supabase_url or not supabase_key then
+        return nil, "Supabase credentials not configured"
+    end
+
+    local offset = (page - 1) * page_size
+    local data_url = string.format(
+        "%s/rest/v1/texts?deleted_at=is.null&order=created_at.desc&limit=%d&offset=%d",
+        supabase_url, page_size, offset
+    )
+
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local response_body = {}
+
+    local success, result, status_code, headers = pcall(function()
+        return http.request({
+            url = data_url,
+            method = "GET",
+            headers = {
+                ["apikey"] = supabase_key,
+                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Content-Type"] = "application/json",
+                ["Prefer"] = "count=exact",
+            },
+            sink = ltn12.sink.table(response_body),
+            timeout = 10,
+        })
+    end)
+
+    if not success then
+        return nil, "Network error: " .. tostring(result)
+    end
+
+    if status_code == 200 or status_code == 206 then
+        local json = require("json")
+        local success_decode, data = pcall(function()
+            return json.decode(table.concat(response_body))
+        end)
+
+        if not success_decode then
+            return nil, "Failed to parse JSON response: " .. tostring(data)
+        end
+        if type(data) ~= "table" then
+            return nil, "Invalid response format: expected array"
+        end
+
+        local total_count = 0
+        if headers["content-range"] then
+            total_count = tonumber(headers["content-range"]:match("/(%d+)") or "0")
+        end
+        local total_pages = math.ceil(total_count / page_size)
+
+        return {
+            texts = data,
+            page = page,
+            page_size = page_size,
+            total_count = total_count,
+            total_pages = total_pages,
+            has_next = page < total_pages,
+            has_prev = page > 1,
+        }, nil
+    elseif status_code == 401 or status_code == 403 then
+        return nil, "Authentication failed. Please check your API key."
+    else
+        return nil, "HTTP " .. tostring(status_code) .. ": " .. table.concat(response_body)
+    end
+end
+
+-- ============================================
 -- FETCH WORDS FROM SUPABASE WITH PAGINATION
 -- ============================================
 
@@ -4384,6 +4635,373 @@ function DictSync:onFlashcardDialogClosed()
     self.flashcard_session = nil
 end
 
+-- ============================================
+-- TEXTS: CHAPTER EXTRACTION & FILE EXPORT
+-- ============================================
+
+-- Extract the plain text of the chapter the user is currently reading.
+-- Returns (title, text, language_name) on success, or (nil, error_message).
+-- Reliable for reflowable documents (EPUB/FB2/...); scanned PDF/DjVu are not supported.
+function DictSync:getCurrentChapterText()
+    if not (self.ui and self.ui.document) then
+        return nil, "Open a book first."
+    end
+
+    local document = self.ui.document
+
+    -- Determine the current page.
+    local page
+    if self.ui.view and self.ui.view.state and self.ui.view.state.page then
+        page = self.ui.view.state.page
+    else
+        local ok_page, p = pcall(function() return document:getCurrentPage() end)
+        if ok_page then page = p end
+    end
+    if not page then
+        return nil, "Could not determine the current page."
+    end
+
+    -- Chapter text extraction relies on xpointer ranges, which only reflowable
+    -- (CRE) documents provide. Bail out gracefully on other formats.
+    if type(document.getTextFromXPointers) ~= "function" then
+        return nil, "Chapter capture isn't supported for this document format."
+    end
+
+    local toc = self.ui.toc
+    if not (toc and type(toc.toc) == "table" and #toc.toc > 0) then
+        return nil, "This book has no table of contents to locate the chapter."
+    end
+
+    -- Find the chapter boundaries: the TOC entry with the greatest page <= current
+    -- page is the chapter start; the next entry (by page) is the chapter end.
+    local start_entry, end_entry
+    for _, entry in ipairs(toc.toc) do
+        if entry.page and entry.page <= page then
+            if not start_entry or entry.page >= start_entry.page then
+                start_entry = entry
+            end
+        end
+    end
+    if not start_entry then
+        -- Before the first TOC entry: treat the first chapter as the start.
+        start_entry = toc.toc[1]
+    end
+    for _, entry in ipairs(toc.toc) do
+        if entry.page and entry.page > start_entry.page then
+            if not end_entry or entry.page < end_entry.page then
+                end_entry = entry
+            end
+        end
+    end
+
+    if not (start_entry and start_entry.xpointer) then
+        return nil, "Chapter capture isn't supported for this document format."
+    end
+
+    local end_xpointer = end_entry and end_entry.xpointer  -- nil = to end of book
+    local ok_text, text = pcall(function()
+        return document:getTextFromXPointers(start_entry.xpointer, end_xpointer)
+    end)
+    if not ok_text or not text or text == "" then
+        return nil, "Could not extract chapter text from this document."
+    end
+
+    -- Build a title: "<Book> — <Chapter>".
+    local chapter_title = start_entry.title
+    local ok_ct, ct = pcall(function() return toc:getTocTitleByPage(page) end)
+    if ok_ct and ct and ct ~= "" then
+        chapter_title = ct
+    end
+    local book_title
+    local ok_props, props = pcall(function() return document:getProps() end)
+    if ok_props and props and props.title and props.title ~= "" then
+        book_title = props.title
+    end
+    local title
+    if book_title and chapter_title then
+        title = book_title .. " — " .. chapter_title
+    else
+        title = chapter_title or book_title or "Untitled chapter"
+    end
+
+    -- Language name (e.g. "German"); nil lets the cloud side decide.
+    local language
+    if ok_props and props and props.language then
+        language = self:mapLanguageCode(props.language)
+    end
+
+    return title, text, language
+end
+
+-- Resolve the export directory for cloud texts, creating it if needed.
+function DictSync:getTextsExportDir()
+    local dir = self.settings and self.settings:readSetting("texts_export_dir")
+    if not dir or dir == "" then
+        local home
+        if G_reader_settings then
+            home = G_reader_settings:readSetting("home_dir")
+        end
+        local base = home or DataStorage:getDataDir()
+        dir = base .. "/dictionary_texts"
+    end
+    local util = require("util")
+    pcall(function() util.makePath(dir) end)
+    return dir
+end
+
+-- Turn a text title into a safe .txt filename.
+local function sanitizeFilename(title)
+    local name = title or "text"
+    name = name:gsub("[/\\\r\n\t]", " ")      -- path separators / control chars
+    name = name:gsub('[<>:"|?*]', "")          -- characters illegal on common FSs
+    name = name:gsub("%s+", " ")
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then name = "text" end
+    if #name > 120 then name = name:sub(1, 120) end
+    return name .. ".txt"
+end
+
+-- Write a single cloud text row to a .txt file. Returns (path, nil) or (nil, err).
+function DictSync:exportTextToFile(text_row)
+    if type(text_row) ~= "table" then
+        return nil, "Invalid text record"
+    end
+    local body = text_row.text or ""
+    if body == "" then
+        return nil, "Text has no content"
+    end
+
+    local dir = self:getTextsExportDir()
+    local filename = sanitizeFilename(text_row.title)
+
+    -- De-duplicate filenames so we never clobber an existing export.
+    local lfs = require("libs/libkoreader-lfs")
+    local path = dir .. "/" .. filename
+    if lfs.attributes(path, "mode") then
+        local base = filename:gsub("%.txt$", "")
+        local i = 2
+        repeat
+            path = string.format("%s/%s (%d).txt", dir, base, i)
+            i = i + 1
+        until not lfs.attributes(path, "mode")
+    end
+
+    local f, err = io.open(path, "w")
+    if not f then
+        return nil, "Could not write file: " .. tostring(err)
+    end
+    -- Prefix the title as a heading for readability when opened as a book.
+    if text_row.title and text_row.title ~= "" then
+        f:write(text_row.title, "\n\n")
+    end
+    f:write(body)
+    f:close()
+    return path, nil
+end
+
+-- Fetch every cloud text (paging through results) and export each as a file.
+function DictSync:exportAllCloudTexts()
+    local page = 1
+    local exported = 0
+    local total = nil
+    while true do
+        local result, err = self:fetchTextsFromSupabase(page, 50)
+        if not result then
+            if exported > 0 then
+                break  -- partial success; report what we managed
+            end
+            return nil, err or "Failed to fetch texts"
+        end
+        total = result.total_count
+        for _, row in ipairs(result.texts) do
+            local _, export_err = self:exportTextToFile(row)
+            if not export_err then
+                exported = exported + 1
+            end
+        end
+        if not result.has_next then
+            break
+        end
+        page = page + 1
+    end
+    return exported, self:getTextsExportDir()
+end
+
+-- Save the current chapter to Supabase (menu action).
+function DictSync:handleSaveCurrentChapter()
+    if not (self.ui and self.ui.document) then
+        UIManager:show(InfoMessage:new{ text = "Open a book first." })
+        return
+    end
+
+    local title, text, language = self:getCurrentChapterText()
+    if not title then
+        -- getCurrentChapterText returns (nil, error_message)
+        UIManager:show(InfoMessage:new{ text = text or "Could not read the current chapter." })
+        return
+    end
+
+    UIManager:show(InfoMessage:new{ text = "Saving chapter…", timeout = 1 })
+
+    NetworkMgr:runWhenOnline(function()
+        Trapper:wrap(function()
+            local ok, msg = self:saveTextToSupabase({
+                title = title,
+                text = text,
+                language = language,
+            })
+            UIManager:nextTick(function()
+                if ok then
+                    UIManager:show(InfoMessage:new{
+                        text = "Saved chapter to cloud:\n" .. title,
+                    })
+                else
+                    UIManager:show(InfoMessage:new{
+                        text = "Failed to save chapter: " .. (msg or "unknown error"),
+                    })
+                end
+            end)
+        end)
+    end)
+end
+
+-- Export every cloud text to the export folder (menu action).
+function DictSync:handleExportAllCloudTexts()
+    UIManager:show(InfoMessage:new{ text = "Exporting cloud texts…", timeout = 1 })
+
+    NetworkMgr:runWhenOnline(function()
+        Trapper:wrap(function()
+            local exported, dir_or_err = self:exportAllCloudTexts()
+            UIManager:nextTick(function()
+                if not exported then
+                    UIManager:show(InfoMessage:new{
+                        text = "Failed to export texts: " .. tostring(dir_or_err),
+                    })
+                elseif exported == 0 then
+                    UIManager:show(InfoMessage:new{ text = "No cloud texts to export." })
+                else
+                    UIManager:show(InfoMessage:new{
+                        text = string.format("Exported %d text(s) to:\n%s", exported, dir_or_err),
+                    })
+                end
+            end)
+        end)
+    end)
+end
+
+-- Browse cloud texts in a list; tapping a row exports that text to a file.
+function DictSync:showTextsListDialog(page)
+    page = page or 1
+
+    UIManager:show(InfoMessage:new{ text = "Loading texts…", timeout = 1 })
+
+    NetworkMgr:runWhenOnline(function()
+        Trapper:wrap(function()
+            local result, err = self:fetchTextsFromSupabase(page, 50)
+            UIManager:nextTick(function()
+                if not result then
+                    UIManager:show(InfoMessage:new{
+                        text = "Error loading texts: " .. (err or "Unknown error"),
+                    })
+                    return
+                end
+                if #result.texts == 0 then
+                    UIManager:show(InfoMessage:new{ text = "No cloud texts found." })
+                    return
+                end
+
+                local Menu = require("ui/widget/menu")
+                local items = {}
+                for i, row in ipairs(result.texts) do
+                    local num = (page - 1) * result.page_size + i
+                    local lang = row.language and (" (" .. row.language .. ")") or ""
+                    table.insert(items, {
+                        text = string.format("%d. %s%s", num, row.title or "Untitled", lang),
+                        callback = function()
+                            local path, export_err = self:exportTextToFile(row)
+                            if path then
+                                UIManager:show(InfoMessage:new{ text = "Exported to:\n" .. path })
+                            else
+                                UIManager:show(InfoMessage:new{
+                                    text = "Export failed: " .. (export_err or "unknown error"),
+                                })
+                            end
+                        end,
+                    })
+                end
+
+                -- Server-side paging controls as list entries.
+                if result.has_prev then
+                    table.insert(items, {
+                        text = "◄ Previous page",
+                        callback = function()
+                            if self.texts_menu then UIManager:close(self.texts_menu) end
+                            self:showTextsListDialog(page - 1)
+                        end,
+                    })
+                end
+                if result.has_next then
+                    table.insert(items, {
+                        text = "Next page ►",
+                        callback = function()
+                            if self.texts_menu then UIManager:close(self.texts_menu) end
+                            self:showTextsListDialog(page + 1)
+                        end,
+                    })
+                end
+
+                local menu = Menu:new{
+                    title = string.format("Cloud texts (page %d/%d)",
+                        result.page, math.max(result.total_pages, 1)),
+                    item_table = items,
+                    is_borderless = true,
+                    is_popout = false,
+                    width = Screen:getWidth(),
+                    height = Screen:getHeight(),
+                }
+                menu.close_callback = function()
+                    UIManager:close(menu)
+                    self.texts_menu = nil
+                end
+                self.texts_menu = menu
+                UIManager:show(menu)
+            end)
+        end)
+    end)
+end
+
+-- Configure the folder cloud texts are exported into.
+function DictSync:showTextsExportDirDialog()
+    local dialog
+    dialog = InputDialog:new{
+        title = "Texts export folder",
+        input = self.settings:readSetting("texts_export_dir") or self:getTextsExportDir(),
+        description = "Folder where pulled cloud texts are saved as .txt files.",
+        buttons = {
+            {
+                {
+                    text = "Cancel",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = "Save",
+                    is_enter_default = true,
+                    callback = function()
+                        local dir = dialog:getInputText()
+                        self.settings:saveSetting("texts_export_dir", dir)
+                        UIManager:close(dialog)
+                        UIManager:show(InfoMessage:new{ text = "Export folder saved:\n" .. dir })
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
 -- Add to main menu
 function DictSync:addToMainMenu(menu_items)
     logger.info("Dictionary Sync: addToMainMenu called")
@@ -4409,6 +5027,37 @@ function DictSync:addToMainMenu(menu_items)
                 callback = function()
                     self:showFlashcardsLauncher()
                 end,
+            },
+            {
+                text = "Save current chapter as text",
+                callback = function()
+                    self:handleSaveCurrentChapter()
+                end,
+            },
+            {
+                text = "Cloud texts",
+                sub_item_table = {
+                    {
+                        text = "Export all to folder",
+                        keep_menu_open = true,
+                        callback = function()
+                            self:handleExportAllCloudTexts()
+                        end,
+                    },
+                    {
+                        text = "Browse & export…",
+                        callback = function()
+                            self:showTextsListDialog(1)
+                        end,
+                    },
+                    {
+                        text = "Set export folder",
+                        keep_menu_open = true,
+                        callback = function()
+                            self:showTextsExportDirDialog()
+                        end,
+                    },
+                },
             },
             {
                 text = "About",
@@ -4462,7 +5111,6 @@ function DictSync:init()
                 fullname = "Dictionary Sync",
                 description = "Save words to Supabase dictionary database",
                 version = "1.0.0",
-                build = "0",
             }
             logger.info("Dictionary Sync: Using default meta")
         end
