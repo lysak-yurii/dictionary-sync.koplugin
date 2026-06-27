@@ -2924,6 +2924,7 @@ function DictSync:showConfigDialog()
         local login_dialog
         login_dialog = MultiInputDialog:new{
             title = "Sign in",
+            description = "New to Lingueez? Create your account at lingueez.app, then sign in here.",
             fields = {
                 { description = "Email", input_type = "text", hint = "you@example.com" },
                 { description = "Password", input_type = "text", text_type = "password" },
@@ -4389,7 +4390,7 @@ local WordsListViewer = InputContainer:extend{
 
 function WordsListViewer:init()
     local titlebar = TitleBar:new{
-        title = self.title_text or "My Dictionary Words",
+        title = self.title_text or "My Words",
     }
     
     local button_table = ButtonTable:new{
@@ -4781,7 +4782,7 @@ function DictSync:showWordsListDialog(page, filters)
                 
                 -- Create widget viewer
                 self.words_dialog = WordsListViewer:new{
-                    title_text = "My Dictionary Words",
+                    title_text = "My Words",
                     text = page_info .. word_text,
                     buttons = buttons,
                 }

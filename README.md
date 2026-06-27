@@ -9,11 +9,14 @@ While you read, long-press a word and tap **Save to Lingueez**: the plugin detec
 the language, translates it, and stores it in your account. By the time you next open
 Lingueez on your computer, in reader or in the web, the word is already there — ready to study.
 
+![Reviewing saved words with flashcards on the reader](screenshots/flashcards.png)
+
 ## Features
 
 - **Flashcards - Review on the reader** — flip through flashcards and your saved words right where
   you read.
-- **Quick save while you read** — long-press any word and save it without leaving the book.
+- **Quick save while you read** — long-press any word and save it without leaving the book
+  ([screenshot](screenshots/save-word.png)).
 - **Instant translation** — Google Translate built in, with optional DeepL.
 - **Knows the language** — the source language is detected from the book, so there is
   nothing to pick for each word.
@@ -51,7 +54,8 @@ with your account.
 
 Typing on an e-reader is painful, so Google sign-in happens on your phone:
 
-1. Tap **Sign in with Google** — the reader shows a **QR code**.
+1. Tap **Sign in with Google** — the reader shows a **QR code**
+   ([screenshot](screenshots/google-qr.png)).
 2. **Scan it with your phone** and sign in with Google there, with a real keyboard.
 3. Your phone shows *"Signed in — return to your e-reader"*, and the reader picks it up
    within a couple of seconds and signs in **automatically**.
