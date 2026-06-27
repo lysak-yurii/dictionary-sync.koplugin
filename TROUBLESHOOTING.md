@@ -1,88 +1,75 @@
-# Troubleshooting Dictionary Sync Plugin
+# Troubleshooting
 
-## Plugin Not Appearing in Menu or Word Selection
+Common issues and how to resolve them.
 
-If the plugin shows up in Plugin Management but doesn't appear in the menu or word selection, try these steps:
+## The plugin doesn't appear in the menu
 
-### 1. Verify Plugin is Enabled
-- Go to **Settings** → **Plugin Management**
-- Find "Dictionary Sync" in the list
-- Make sure it's **enabled** (toggle should be ON)
+The plugin only loads while a book is open, so first **open any document**, then look
+under **Menu → Tools → Lingueez**. If it's still missing, work through the checks below.
 
-### 2. Restart KOReader
-- Close KOReader completely
-- Reopen KOReader
-- Open a document (the plugin only works when a document is open)
+### 1. Confirm it's installed in the right place
 
-### 3. Check Plugin Location
-The plugin should be in:
-- **Android**: `/sdcard/koreader/plugins/dictionary-sync.koplugin/`
-- **Linux**: `~/.config/koreader/plugins/dictionary-sync.koplugin/`
-- **Windows**: Check KOReader settings for plugin directory
+The folder must be named exactly `lingueez.koplugin` and sit in your KOReader plugins
+directory:
 
-The folder must be named exactly `dictionary-sync.koplugin` (with the `.koplugin` extension)
+- **Android** — `/sdcard/koreader/plugins/lingueez.koplugin/`
+- **Linux** — `~/.config/koreader/plugins/lingueez.koplugin/`
+- **Kobo / Kindle / other** — see the KOReader documentation for the plugin path.
 
-### 4. Verify Files Exist
-Make sure these files exist in the plugin folder:
-- `_meta.lua`
-- `main.lua`
+Inside that folder you should see at least `_meta.lua` and `main.lua`.
 
-### 5. Check KOReader Logs
-- Look for "Dictionary Sync" messages in KOReader logs
-- Logs location varies by platform:
-  - **Android**: Check logcat or KOReader log file
-  - **Linux**: `~/.config/koreader/koreader.log`
-  - **Windows**: Check KOReader installation directory for log files
+### 2. Enable the plugin
 
-Look for these messages:
-- "Dictionary Sync: init() called"
-- "Dictionary Sync: Menu registered"
-- "Dictionary Sync: Highlight dialog button added"
-- "Dictionary Sync plugin initialized successfully"
+Go to **Settings → Plugin Management**, find **Lingueez**, and make sure it's switched
+**on**.
 
-If you see error messages, note them down.
+### 3. Restart KOReader
 
-### 6. Test in Document Context
-- The plugin only works when a document is open
-- Open any book/document in KOReader
-- Try accessing the menu: **Menu** → **Dictionary Sync**
-- Try selecting a word - you should see "Save to Dictionary" in the popup
+Close KOReader completely, reopen it, and open a book. Plugins are only picked up on a
+fresh start.
 
-### 7. Manual Menu Check
-- Open a document
-- Go to **Menu** → Look for **Dictionary Sync** under the **Tools** section
-- If it's not there, the plugin may not be initializing correctly
+## "Save to Lingueez" doesn't show when I select a word
 
-### 8. Reinstall Plugin
-If nothing works:
-1. Disable the plugin in Plugin Management
-2. Delete the `dictionary-sync.koplugin` folder
-3. Copy it again to the plugins directory
-4. Restart KOReader
-5. Enable the plugin
-6. Open a document and test
+- Make sure you've actually selected text — long-press a word until it's highlighted.
+- The **Save to Lingueez** button appears in the highlight popup and in the
+  dictionary lookup popup.
+- If it never appears, restart KOReader so the plugin can re-attach to word selection.
 
-## Common Issues
+## I can't sign in
 
-### "No UI context available" in logs
-- This means the plugin is trying to initialize outside of a document
-- Open a document first, then the plugin will initialize
+- Double-check your Lingueez email and password. Create your account on the
+  [desktop or web app](https://lingueez.app) first — the plugin signs you in, it
+  doesn't register new accounts.
+- Confirm the reader is online.
+- Make sure the device's **date and time are correct** — sign-in tokens are
+  time-sensitive and will be rejected if the clock is off.
 
-### Menu appears but word selection doesn't
-- Make sure you're selecting text (long-press or word selection)
-- The "Save to Dictionary" button should appear in the highlight popup menu
-- If it doesn't appear, check logs for "Highlight dialog button added" message
+## A word won't save
 
-### Plugin crashes KOReader
-- Check for syntax errors in `main.lua`
-- Make sure all required modules are available
-- Check KOReader version compatibility
+- It's usually a duplicate — the same word and translation already exist in your
+  dictionary.
+- Otherwise, check that the reader is online and that you're signed in
+  (**Menu → Lingueez → Configure**).
 
-## Still Not Working?
+## Still stuck? Check the logs
 
-If the plugin still doesn't appear after trying all these steps:
-1. Check KOReader version (plugin may require a specific version)
-2. Verify the plugin structure matches exactly the assistant.koplugin example
-3. Check for any error messages in KOReader logs
-4. Try disabling other plugins to rule out conflicts
+KOReader writes a log that often explains the problem. Look for lines beginning with
+`Lingueez:` — for example, a successful start logs *"Lingueez plugin initialized
+successfully"*.
 
+- **Linux** — `~/.config/koreader/crash.log`
+- **Android** — the KOReader log file (or `logcat`)
+- **Other platforms** — see the KOReader documentation for the log location.
+
+When reporting an issue, include your KOReader version and any `Lingueez:` log lines
+around the problem — it makes things much faster to diagnose.
+
+## Still need a hand?
+
+If none of the above resolves it, please
+[open an issue](https://github.com/lysak-yurii/lingueez.koplugin/issues) — include your
+KOReader version and any `Lingueez:` log lines from above so we can get to the bottom of
+it quickly.
+
+You can also reach us at **[support@lingueez.app](mailto:support@lingueez.app)** — we're
+happy to help.

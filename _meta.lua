@@ -1,7 +1,7 @@
 return {
-    name = "dictionary_sync",
-    fullname = "Dictionary Sync",
-    description = "Save words to Supabase dictionary database with automatic translation",
+    name = "lingueez",
+    fullname = "Lingueez",
+    description = "Save words to your Lingueez vocabulary with automatic translation",
     version = "1.0.0",
-    build = "2026061305",
+    build = "2026062703",
 }

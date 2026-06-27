@@ -28,12 +28,18 @@ local MovableContainer = require("ui/widget/container/movablecontainer")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 
 local DictSync = InputContainer:new {
-    name = "dictionary_sync",
+    name = "lingueez",
     meta = nil,
     is_doc_only = true,
-    settings_file = DataStorage:getSettingsDir() .. "/dictionary_sync.lua",
+    settings_file = DataStorage:getSettingsDir() .. "/lingueez.lua",
     settings = nil,
 }
+
+-- Central hosted Lingueez project. Shipped in source on purpose: the anon key is a
+-- PUBLIC client key and Row-Level Security isolates each signed-in user's rows, so
+-- it is safe to distribute. Both can be overridden via SUPABASE_URL / SUPABASE_KEY.
+local DEFAULT_SUPABASE_URL = "https://dtyrmkynrideeknsdlrn.supabase.co"
+local DEFAULT_SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR0eXJta3lucmlkZWVrbnNkbHJuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODE4Njc1MTQsImV4cCI6MjA5NzQ0MzUxNH0.dds5SyMBN9u-0TUumB2nSCx68FJfpm3n63fLq1n9o10"
 
 -- Language mapping from KOReader codes to dictionary app language names
 local LANGUAGE_MAP = {
@@ -329,9 +335,9 @@ function DictSync:translateWord(word, source_lang_name, target_lang_name)
                     return translation, nil
                 end
                 -- If DeepL fails, fall through to Google
-                logger.warn("Dictionary Sync: DeepL translation failed: " .. (error_msg or "unknown error"))
+                logger.warn("Lingueez: DeepL translation failed: " .. (error_msg or "unknown error"))
             else
-                logger.warn("Dictionary Sync: Language not supported by DeepL, falling back to Google")
+                logger.warn("Lingueez: Language not supported by DeepL, falling back to Google")
             end
         end
     end
@@ -356,12 +362,90 @@ function DictSync:urlEncode(str)
     return str
 end
 
+-- === Backend mode + credentials =========================================
+-- Resolved Supabase URL: the user's custom override if set, else the built-in
+-- central Lingueez project.
+function DictSync:getSupabaseUrl()
+    local url = self.settings and self.settings:readSetting("supabase_url")
+    if url and url ~= "" then return url end
+    return DEFAULT_SUPABASE_URL
+end
+
+-- Resolved Supabase anon/public key (matches getSupabaseUrl).
+function DictSync:getSupabaseKey()
+    local key = self.settings and self.settings:readSetting("supabase_key")
+    if key and key ~= "" then return key end
+    return DEFAULT_SUPABASE_KEY
+end
+
+-- True when SUPABASE_URL points somewhere other than the built-in central project.
+function DictSync:isCustomServer()
+    local url = self.settings and self.settings:readSetting("supabase_url")
+    url = url and url:match("^%s*(.-)%s*$") or ""
+    return url ~= "" and url ~= DEFAULT_SUPABASE_URL
+end
+
+-- === Auth session state =================================================
+-- Whether a sync action is permitted: custom mode never needs login; account
+-- mode requires a stored access token.
+function DictSync:isAuthed()
+    if self:isCustomServer() then return true end
+    local token = self.settings and self.settings:readSetting("auth_access_token")
+    return token ~= nil and token ~= ""
+end
+
+-- Guard for sync actions: true if allowed, otherwise prompt the user to sign in.
+function DictSync:ensureAuthed()
+    if self:isAuthed() then return true end
+    UIManager:show(InfoMessage:new{
+        text = "Please sign in first:\nLingueez → Configure → Sign in",
+    })
+    return false
+end
+
+-- Clear the stored session (sign-out / failed refresh).
+function DictSync:clearSession()
+    if not self.settings then return end
+    for _, k in ipairs({ "auth_access_token", "auth_refresh_token",
+                         "auth_expires_at", "auth_user_id", "auth_user_email" }) do
+        self.settings:delSetting(k)
+    end
+    self.settings:flush()
+end
+
+-- Return a non-expired access token in account mode, refreshing if it is within
+-- 60s of expiry. Returns nil if not logged in or the refresh failed.
+function DictSync:getValidAccessToken()
+    if not self.settings then return nil end
+    local token = self.settings:readSetting("auth_access_token")
+    if not token or token == "" then return nil end
+    local expires_at = tonumber(self.settings:readSetting("auth_expires_at")) or 0
+    if os.time() >= (expires_at - 60) then
+        if not self:refreshSession() then return nil end
+        token = self.settings:readSetting("auth_access_token")
+    end
+    return token
+end
+
+-- The "Authorization: Bearer ..." value for a PostgREST request. Custom mode uses
+-- the anon key (as today); account mode uses the user JWT so RLS resolves auth.uid(),
+-- falling back to the anon key when not signed in (request will be RLS-restricted).
+function DictSync:getBearerToken()
+    local key = self:getSupabaseKey()
+    if self:isCustomServer() then
+        return "Bearer " .. key
+    end
+    local token = self:getValidAccessToken()
+    return "Bearer " .. (token or key)
+end
+
 -- Check if word exists in Supabase
 function DictSync:checkWordExists(language1, word1, language2, word2)
     if not self.settings then return nil, "Settings not initialized" end
     
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
     
     if not supabase_url or not supabase_key then
         return nil, "Supabase credentials not configured"
@@ -385,7 +469,7 @@ function DictSync:checkWordExists(language1, word1, language2, word2)
             method = "GET",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
             },
             sink = ltn12.sink.table(response_body),
@@ -417,8 +501,9 @@ end
 function DictSync:saveWordToSupabase(word_data)
     if not self.settings then return false, "Settings not initialized" end
     
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
     
     if not supabase_url or not supabase_key then
         return false, "Supabase credentials not configured"
@@ -464,9 +549,9 @@ function DictSync:saveWordToSupabase(word_data)
     
     if existing_word then
         -- Update existing word
-        local url = string.format("%s/rest/v1/words?id=eq.%d",
+        local url = string.format("%s/rest/v1/words?id=eq.%s",
             supabase_url,
-            existing_word.id
+            self:urlEncode(tostring(existing_word.id))
         )
         
         local success, result, status_code, headers = pcall(function()
@@ -475,7 +560,7 @@ function DictSync:saveWordToSupabase(word_data)
                 method = "PATCH",
                 headers = {
                     ["apikey"] = supabase_key,
-                    ["Authorization"] = "Bearer " .. supabase_key,
+                    ["Authorization"] = supabase_bearer,
                     ["Content-Type"] = "application/json",
                     ["Prefer"] = "return=representation",
                 },
@@ -508,7 +593,7 @@ function DictSync:saveWordToSupabase(word_data)
                 method = "POST",
                 headers = {
                     ["apikey"] = supabase_key,
-                    ["Authorization"] = "Bearer " .. supabase_key,
+                    ["Authorization"] = supabase_bearer,
                     ["Content-Type"] = "application/json",
                     ["Prefer"] = "return=representation",
                 },
@@ -549,8 +634,9 @@ end
 function DictSync:checkTextExists(title)
     if not self.settings then return nil, "Settings not initialized" end
 
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
 
     if not supabase_url or not supabase_key then
         return nil, "Supabase credentials not configured"
@@ -571,7 +657,7 @@ function DictSync:checkTextExists(title)
             method = "GET",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
             },
             sink = ltn12.sink.table(response_body),
@@ -604,8 +690,9 @@ end
 function DictSync:saveTextToSupabase(text_data)
     if not self.settings then return false, "Settings not initialized" end
 
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
 
     if not supabase_url or not supabase_key then
         return false, "Supabase credentials not configured"
@@ -641,9 +728,9 @@ function DictSync:saveTextToSupabase(text_data)
 
     if existing_text then
         -- Update existing text
-        local url = string.format("%s/rest/v1/texts?id=eq.%d",
+        local url = string.format("%s/rest/v1/texts?id=eq.%s",
             supabase_url,
-            existing_text.id
+            self:urlEncode(tostring(existing_text.id))
         )
 
         local success, result, status_code, headers = pcall(function()
@@ -652,7 +739,7 @@ function DictSync:saveTextToSupabase(text_data)
                 method = "PATCH",
                 headers = {
                     ["apikey"] = supabase_key,
-                    ["Authorization"] = "Bearer " .. supabase_key,
+                    ["Authorization"] = supabase_bearer,
                     ["Content-Type"] = "application/json",
                     ["Prefer"] = "return=representation",
                 },
@@ -683,7 +770,7 @@ function DictSync:saveTextToSupabase(text_data)
                 method = "POST",
                 headers = {
                     ["apikey"] = supabase_key,
-                    ["Authorization"] = "Bearer " .. supabase_key,
+                    ["Authorization"] = supabase_bearer,
                     ["Content-Type"] = "application/json",
                     ["Prefer"] = "return=representation",
                 },
@@ -721,8 +808,9 @@ function DictSync:fetchTextsFromSupabase(page, page_size)
 
     if not self.settings then return nil, "Settings not initialized" end
 
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
 
     if not supabase_url or not supabase_key then
         return nil, "Supabase credentials not configured"
@@ -744,7 +832,7 @@ function DictSync:fetchTextsFromSupabase(page, page_size)
             method = "GET",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
                 ["Prefer"] = "count=exact",
             },
@@ -800,8 +888,9 @@ end
 function DictSync:fetchTagsFromSupabase(limit, offset)
     if not self.settings then return {}, "Settings not initialized" end
     
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
     
     if not supabase_url or not supabase_key then
         return {}, "Supabase credentials not configured"
@@ -832,7 +921,7 @@ function DictSync:fetchTagsFromSupabase(limit, offset)
             method = "GET",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
                 ["Prefer"] = prefer_exact_count and "count=exact" or nil,
             },
@@ -880,8 +969,9 @@ function DictSync:getWordIdsByTags(tag_names)
     
     if not self.settings then return nil, "Settings not initialized" end
     
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
     
     if not supabase_url or not supabase_key then
         return nil, "Supabase credentials not configured"
@@ -924,7 +1014,7 @@ function DictSync:getWordIdsByTags(tag_names)
             method = "GET",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
             },
             sink = ltn12.sink.table(response_body),
@@ -1054,8 +1144,9 @@ function DictSync:fetchWordsFromSupabase(page, page_size, filters)
     
     if not self.settings then return nil, "Settings not initialized" end
     
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
     
     if not supabase_url or not supabase_key then
         return nil, "Supabase credentials not configured"
@@ -1153,7 +1244,7 @@ function DictSync:fetchWordsFromSupabase(page, page_size, filters)
             method = "GET",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
                 ["Prefer"] = "count=exact",
             },
@@ -1175,7 +1266,7 @@ function DictSync:fetchWordsFromSupabase(page, page_size, filters)
         end)
         
         if not success_decode then
-            logger.err("Dictionary Sync: JSON decode failed: " .. tostring(data))
+            logger.err("Lingueez: JSON decode failed: " .. tostring(data))
             return nil, "Failed to parse JSON response: " .. tostring(data)
         end
         
@@ -1185,7 +1276,7 @@ function DictSync:fetchWordsFromSupabase(page, page_size, filters)
         
         -- Ensure data is a table/array
         if type(data) ~= "table" then
-            logger.err("Dictionary Sync: Response is not a table: " .. type(data))
+            logger.err("Lingueez: Response is not a table: " .. type(data))
             return nil, "Invalid response format: expected array, got " .. type(data)
         end
         
@@ -1207,7 +1298,7 @@ function DictSync:fetchWordsFromSupabase(page, page_size, filters)
 
         data = normalized_words
 
-        logger.dbg("Dictionary Sync: Fetched " .. #data .. " words, total: " .. total_count)
+        logger.dbg("Lingueez: Fetched " .. #data .. " words, total: " .. total_count)
         
         return {
             words = data,
@@ -1245,16 +1336,17 @@ end
 function DictSync:getWordTags(word_id)
     if not self.settings then return {}, "Settings not initialized" end
     
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
     
     if not supabase_url or not supabase_key then
         return {}, "Supabase credentials not configured"
     end
     
-    local url = string.format("%s/rest/v1/word_tags?word_id=eq.%d&select=*,tags(tag_name)",
+    local url = string.format("%s/rest/v1/word_tags?word_id=eq.%s&select=*,tags(tag_name)",
         supabase_url,
-        word_id
+        self:urlEncode(tostring(word_id))
     )
     
     local http = require("socket.http")
@@ -1267,7 +1359,7 @@ function DictSync:getWordTags(word_id)
             method = "GET",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
             },
             sink = ltn12.sink.table(response_body),
@@ -1343,7 +1435,7 @@ function DictSync:fetchWikipediaDefinition(word, language)
                 url = url,
                 method = "GET",
                 headers = {
-                    ["User-Agent"] = "KOReader Dictionary Sync Plugin",
+                    ["User-Agent"] = "KOReader Lingueez Plugin",
                 },
                 sink = ltn12.sink.table(response_body),
                 timeout = 10,
@@ -1389,7 +1481,7 @@ function DictSync:fetchWikipediaDefinition(word, language)
                 url = url,
                 method = "GET",
                 headers = {
-                    ["User-Agent"] = "KOReader Dictionary Sync Plugin",
+                    ["User-Agent"] = "KOReader Lingueez Plugin",
                 },
                 sink = ltn12.sink.table(response_body),
                 timeout = 10,
@@ -1435,16 +1527,17 @@ function DictSync:fetchWordById(word_id, filters)
     filters = filters or self.words_filters or {}
     if not self.settings then return nil, "Settings not initialized" end
     
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
     
     if not supabase_url or not supabase_key then
         return nil, "Supabase credentials not configured"
     end
     
-    local url = string.format("%s/rest/v1/words?id=eq.%d",
+    local url = string.format("%s/rest/v1/words?id=eq.%s",
         supabase_url,
-        word_id
+        self:urlEncode(tostring(word_id))
     )
     
     local http = require("socket.http")
@@ -1457,7 +1550,7 @@ function DictSync:fetchWordById(word_id, filters)
             method = "GET",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
             },
             sink = ltn12.sink.table(response_body),
@@ -1535,7 +1628,8 @@ function DictSync:fetchWordSource(supabase_url, supabase_key, word_id)
     if not supabase_url or not supabase_key or not word_id then
         return nil, "Supabase credentials or word id missing"
     end
-    
+    local supabase_bearer = self:getBearerToken()
+
     local http = require("socket.http")
     local ltn12 = require("ltn12")
     local response_body = {}
@@ -1549,7 +1643,7 @@ function DictSync:fetchWordSource(supabase_url, supabase_key, word_id)
             method = "GET",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
             },
             sink = ltn12.sink.table(response_body),
             timeout = 10,
@@ -1585,8 +1679,9 @@ function DictSync:updateWordDefinition(word_id, definition, definition2, existin
     if not self.settings then return false, "Settings not initialized" end
     if not word_id then return false, "Word ID missing" end
     
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
     
     if not supabase_url or not supabase_key then
         return false, "Supabase credentials not configured"
@@ -1612,7 +1707,7 @@ function DictSync:updateWordDefinition(word_id, definition, definition2, existin
         if current_source then
             source_value = current_source
         elseif source_error then
-            logger.warn("Dictionary Sync: Could not fetch source for word " .. tostring(word_id) .. ": " .. source_error)
+            logger.warn("Lingueez: Could not fetch source for word " .. tostring(word_id) .. ": " .. source_error)
         end
     end
     if source_value and source_value ~= "" then
@@ -1634,7 +1729,7 @@ function DictSync:updateWordDefinition(word_id, definition, definition2, existin
             method = "PATCH",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
                 ["Prefer"] = "return=representation",
             },
@@ -1645,7 +1740,7 @@ function DictSync:updateWordDefinition(word_id, definition, definition2, existin
     end)
     
     if not success then
-        logger.err("Dictionary Sync: Definition update network error: " .. tostring(result))
+        logger.err("Lingueez: Definition update network error: " .. tostring(result))
         return false, "Network error: " .. tostring(result)
     end
     
@@ -1670,7 +1765,7 @@ function DictSync:updateWordDefinition(word_id, definition, definition2, existin
                 return true, "Definition updated successfully"
             end
         end
-        logger.warn("Dictionary Sync: Definition update returned empty body for word " .. tostring(word_id))
+        logger.warn("Lingueez: Definition update returned empty body for word " .. tostring(word_id))
         return true, "Definition update requested"
     elseif status_code == 204 then
         return true, "Definition updated successfully"
@@ -1687,8 +1782,9 @@ function DictSync:updateWordEntry(word_id, word_data)
     if not word_id then return false, "Word ID missing" end
     if not word_data then return false, "Word data missing" end
     
-    local supabase_url = self.settings:readSetting("supabase_url")
-    local supabase_key = self.settings:readSetting("supabase_key")
+    local supabase_url = self:getSupabaseUrl()
+    local supabase_key = self:getSupabaseKey()
+    local supabase_bearer = self:getBearerToken()
     
     if not supabase_url or not supabase_key then
         return false, "Supabase credentials not configured"
@@ -1715,7 +1811,7 @@ function DictSync:updateWordEntry(word_id, word_data)
         if current_source then
             source_value = current_source
         elseif source_error then
-            logger.warn("Dictionary Sync: Could not fetch source for word " .. tostring(word_id) .. ": " .. source_error)
+            logger.warn("Lingueez: Could not fetch source for word " .. tostring(word_id) .. ": " .. source_error)
         end
     end
     if source_value and source_value ~= "" then
@@ -1738,7 +1834,7 @@ function DictSync:updateWordEntry(word_id, word_data)
             method = "PATCH",
             headers = {
                 ["apikey"] = supabase_key,
-                ["Authorization"] = "Bearer " .. supabase_key,
+                ["Authorization"] = supabase_bearer,
                 ["Content-Type"] = "application/json",
                 ["Prefer"] = "return=representation",
             },
@@ -1749,7 +1845,7 @@ function DictSync:updateWordEntry(word_id, word_data)
     end)
     
     if not success then
-        logger.err("Dictionary Sync: Word update network error: " .. tostring(result))
+        logger.err("Lingueez: Word update network error: " .. tostring(result))
         return false, "Network error: " .. tostring(result)
     end
     
@@ -1774,7 +1870,7 @@ function DictSync:updateWordEntry(word_id, word_data)
                 return true, "Word updated successfully"
             end
         end
-        logger.warn("Dictionary Sync: Word update returned empty body for word " .. tostring(word_id))
+        logger.warn("Lingueez: Word update returned empty body for word " .. tostring(word_id))
         return true, "Word update requested"
     elseif status_code == 204 then
         return true, "Word updated successfully"
@@ -1786,16 +1882,541 @@ function DictSync:updateWordEntry(word_id, word_data)
     end
 end
 
+-- === Supabase Auth (GoTrue) =============================================
+-- Sign-in against the built-in central project so per-user RLS scopes the
+-- user's words/texts/tags. Login is only meaningful in account mode; custom
+-- (personal-schema) servers are anonymous and never call these.
+
+-- Minimal SHA-256 (LuaJIT BitOp) for PKCE s256 code challenges.
+local bit = require("bit")
+local band, bor, bxor, bnot = bit.band, bit.bor, bit.bxor, bit.bnot
+local rshift, lshift, ror, tobit = bit.rshift, bit.lshift, bit.ror, bit.tobit
+
+local SHA256_K = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+}
+
+local function u32be(n)
+    return string.char(band(rshift(n, 24), 0xff), band(rshift(n, 16), 0xff),
+                       band(rshift(n, 8), 0xff), band(n, 0xff))
+end
+
+local function sha256_bytes(message)
+    local h0,h1,h2,h3,h4,h5,h6,h7 =
+        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
+    local len = #message
+    local msg = message .. "\128"
+    while (#msg % 64) ~= 56 do msg = msg .. "\0" end
+    local bitlen = len * 8
+    msg = msg .. u32be(math.floor(bitlen / 4294967296)) .. u32be(bitlen % 4294967296)
+    for chunk = 1, #msg, 64 do
+        local w = {}
+        for i = 0, 15 do
+            local b1,b2,b3,b4 = string.byte(msg, chunk + i*4, chunk + i*4 + 3)
+            w[i] = bor(lshift(b1, 24), lshift(b2, 16), lshift(b3, 8), b4)
+        end
+        for i = 16, 63 do
+            local s0 = bxor(ror(w[i-15], 7), ror(w[i-15], 18), rshift(w[i-15], 3))
+            local s1 = bxor(ror(w[i-2], 17), ror(w[i-2], 19), rshift(w[i-2], 10))
+            w[i] = tobit(w[i-16] + s0 + w[i-7] + s1)
+        end
+        local a,b,c,d,e,f,g,h = h0,h1,h2,h3,h4,h5,h6,h7
+        for i = 0, 63 do
+            local S1 = bxor(ror(e, 6), ror(e, 11), ror(e, 25))
+            local ch = bxor(band(e, f), band(bnot(e), g))
+            local t1 = tobit(h + S1 + ch + SHA256_K[i+1] + w[i])
+            local S0 = bxor(ror(a, 2), ror(a, 13), ror(a, 22))
+            local maj = bxor(band(a, b), band(a, c), band(b, c))
+            local t2 = tobit(S0 + maj)
+            h = g; g = f; f = e; e = tobit(d + t1)
+            d = c; c = b; b = a; a = tobit(t1 + t2)
+        end
+        h0=tobit(h0+a); h1=tobit(h1+b); h2=tobit(h2+c); h3=tobit(h3+d)
+        h4=tobit(h4+e); h5=tobit(h5+f); h6=tobit(h6+g); h7=tobit(h7+h)
+    end
+    return u32be(h0)..u32be(h1)..u32be(h2)..u32be(h3)..u32be(h4)..u32be(h5)..u32be(h6)..u32be(h7)
+end
+
+local B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+local function base64url(data)
+    local function ch(v) return B64URL:sub(v + 1, v + 1) end
+    local out, i, n = {}, 1, #data
+    while i <= n do
+        local b1 = string.byte(data, i)
+        local b2 = string.byte(data, i + 1)
+        local b3 = string.byte(data, i + 2)
+        local x = lshift(b1, 16) + lshift(b2 or 0, 8) + (b3 or 0)
+        out[#out+1] = ch(band(rshift(x, 18), 0x3f))
+        out[#out+1] = ch(band(rshift(x, 12), 0x3f))
+        if b2 then out[#out+1] = ch(band(rshift(x, 6), 0x3f)) end
+        if b3 then out[#out+1] = ch(band(x, 0x3f)) end
+        i = i + 3
+    end
+    return table.concat(out)
+end
+
+local PKCE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+local function random_verifier(length)
+    length = length or 64
+    local t = {}
+    for i = 1, length do
+        local idx = math.random(1, #PKCE_CHARS)
+        t[i] = PKCE_CHARS:sub(idx, idx)
+    end
+    return table.concat(t)
+end
+
+-- POST to a GoTrue endpoint; returns (decoded_table, nil) on 2xx or (nil, message).
+function DictSync:authPost(path, body_table, with_token)
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local json = require("json")
+    local body = json.encode(body_table or {})
+    local response_body = {}
+    local headers = {
+        ["apikey"] = self:getSupabaseKey(),
+        ["Content-Type"] = "application/json",
+        ["Content-Length"] = tostring(#body),
+    }
+    if with_token then
+        local tok = self.settings and self.settings:readSetting("auth_access_token")
+        if tok and tok ~= "" then headers["Authorization"] = "Bearer " .. tok end
+    end
+    local success, code = pcall(function()
+        local _, c = http.request({
+            url = self:getSupabaseUrl() .. path,
+            method = "POST",
+            headers = headers,
+            source = ltn12.source.string(body),
+            sink = ltn12.sink.table(response_body),
+            timeout = 15,
+        })
+        return c
+    end)
+    if not success then
+        return nil, "Network error: " .. tostring(code)
+    end
+    local text = table.concat(response_body)
+    local decoded
+    pcall(function() decoded = json.decode(text) end)
+    if type(code) == "number" and code >= 200 and code < 300 then
+        return decoded or {}, nil
+    end
+    local msg = decoded and (decoded.error_description or decoded.msg
+        or decoded.error or decoded.message) or text
+    return nil, (msg and msg ~= "") and msg or ("HTTP " .. tostring(code))
+end
+
+-- Persist a GoTrue token response into the settings store.
+function DictSync:storeSession(data)
+    if not data or not data.access_token or not self.settings then return false end
+    self.settings:saveSetting("auth_access_token", data.access_token)
+    if data.refresh_token then
+        self.settings:saveSetting("auth_refresh_token", data.refresh_token)
+    end
+    local expires_at = tonumber(data.expires_at)
+    if not expires_at then
+        expires_at = os.time() + (tonumber(data.expires_in) or 3600)
+    end
+    self.settings:saveSetting("auth_expires_at", expires_at)
+    local user = data.user or {}
+    if user.id then self.settings:saveSetting("auth_user_id", user.id) end
+    if user.email then self.settings:saveSetting("auth_user_email", user.email) end
+    self.settings:flush()
+    return true
+end
+
+-- Email/password sign-in. Returns (true) or (false, message).
+function DictSync:signInWithPassword(email, password)
+    if not email or email == "" or not password or password == "" then
+        return false, "Email and password are required"
+    end
+    local data, err = self:authPost("/auth/v1/token?grant_type=password",
+        { email = email, password = password })
+    if not data or not data.access_token then
+        return false, err or "Sign-in failed"
+    end
+    self:storeSession(data)
+    return true, nil
+end
+
+-- Refresh the access token using the stored refresh token. Clears the session
+-- (forcing re-login) if the refresh token is no longer valid.
+function DictSync:refreshSession()
+    local rtoken = self.settings and self.settings:readSetting("auth_refresh_token")
+    if not rtoken or rtoken == "" then return false end
+    local data = self:authPost("/auth/v1/token?grant_type=refresh_token",
+        { refresh_token = rtoken })
+    if not data or not data.access_token then
+        self:clearSession()
+        return false
+    end
+    self:storeSession(data)
+    return true
+end
+
+-- Sign out: best-effort server-side revoke, then clear local session.
+function DictSync:signOut()
+    pcall(function() self:authPost("/auth/v1/logout", {}, true) end)
+    self:clearSession()
+    return true
+end
+
+-- Redirect target for the Google OAuth flow. Must be whitelisted in the Supabase
+-- project's auth settings (Authentication -> URL Configuration -> Redirect URLs).
+-- Defaults to the loopback the desktop app uses: nothing runs there from a phone/
+-- e-reader browser, so the single-use ?code=... is left untouched and stays visible
+-- in the address bar for the user to copy and paste back into the plugin.
+function DictSync:getOAuthRedirectUrl()
+    local r = self.settings and self.settings:readSetting("oauth_redirect_url")
+    if r and r ~= "" then return r end
+    return "http://127.0.0.1:53682"
+end
+
+-- Build the Google authorize URL (PKCE s256) and stash the code verifier.
+-- redirect_override lets the QR flow point at the phone relay page; otherwise the
+-- manual-paste flow uses the loopback default.
+function DictSync:buildGoogleAuthUrl(redirect_override)
+    math.randomseed(os.time() + math.floor(os.clock() * 1000))
+    local verifier = random_verifier(64)
+    self.settings:saveSetting("auth_pkce_verifier", verifier)
+    self.settings:flush()
+    local challenge = base64url(sha256_bytes(verifier))
+    return string.format(
+        "%s/auth/v1/authorize?provider=google&code_challenge=%s&code_challenge_method=s256&redirect_to=%s",
+        self:getSupabaseUrl(),
+        self:urlEncode(challenge),
+        self:urlEncode(redirect_override or self:getOAuthRedirectUrl()))
+end
+
+-- Static relay page (GitHub Pages) where the phone drops the OAuth code into the
+-- device_auth rendezvous table for the reader to poll. Must be whitelisted in the
+-- Supabase project's redirect URLs.
+function DictSync:getOAuthRelayUrl()
+    local r = self.settings and self.settings:readSetting("oauth_relay_url")
+    if r and r ~= "" then return r end
+    return "https://lingueez.app/koreader-link.html"
+end
+
+-- One poll of the rendezvous table; returns the auth code string or nil. Uses the
+-- anon key directly (the user isn't signed in yet).
+function DictSync:pollDeviceLink(device_id)
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local json = require("json")
+    local key = self:getSupabaseKey()
+    local url = string.format("%s/rest/v1/device_auth?device_id=eq.%s&select=code",
+        self:getSupabaseUrl(), self:urlEncode(device_id))
+    local response_body = {}
+    local ok, status = pcall(function()
+        local _, c = http.request({
+            url = url,
+            method = "GET",
+            headers = {
+                ["apikey"] = key,
+                ["Authorization"] = "Bearer " .. key,
+                ["Content-Type"] = "application/json",
+            },
+            sink = ltn12.sink.table(response_body),
+            timeout = 10,
+        })
+        return c
+    end)
+    if not ok or status ~= 200 then return nil end
+    local data
+    pcall(function() data = json.decode(table.concat(response_body)) end)
+    if type(data) == "table" and data[1] and data[1].code and data[1].code ~= "" then
+        return data[1].code
+    end
+    return nil
+end
+
+-- Best-effort delete of the rendezvous row after a successful exchange.
+function DictSync:deleteDeviceLink(device_id)
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local key = self:getSupabaseKey()
+    local url = string.format("%s/rest/v1/device_auth?device_id=eq.%s",
+        self:getSupabaseUrl(), self:urlEncode(device_id))
+    pcall(function()
+        http.request({
+            url = url,
+            method = "DELETE",
+            headers = {
+                ["apikey"] = key,
+                ["Authorization"] = "Bearer " .. key,
+            },
+            sink = ltn12.sink.table({}),
+            timeout = 10,
+        })
+    end)
+end
+
+-- Exchange the pasted authorization code (or full redirect URL) for a session.
+function DictSync:exchangeCodeForSession(code)
+    local verifier = self.settings and self.settings:readSetting("auth_pkce_verifier")
+    if not verifier or verifier == "" then
+        return false, "No pending Google sign-in. Please start again."
+    end
+    if not code or code == "" then return false, "Authorization code is required" end
+    code = code:match("^%s*(.-)%s*$")
+    local extracted = code:match("[?&]code=([^&#]+)")
+    if extracted then code = extracted end
+    local data, err = self:authPost("/auth/v1/token?grant_type=pkce",
+        { auth_code = code, code_verifier = verifier })
+    if not data or not data.access_token then
+        return false, err or "Code exchange failed"
+    end
+    self.settings:delSetting("auth_pkce_verifier")
+    self:storeSession(data)
+    return true, nil
+end
+
+-- Modal showing a QR of the Google authorize URL plus Cancel / manual-entry
+-- buttons, modeled on this plugin's WordDetailViewer pattern.
+local GoogleQRViewer = InputContainer:extend{
+    width = nil,
+    qr_text = nil,
+    title_text = "Scan to sign in with Google",
+    hint_text = nil,
+    buttons = nil,
+    on_close_callback = nil,
+}
+
+function GoogleQRViewer:init()
+    local QRWidget = require("ui/widget/qrwidget")
+    local TextBoxWidget = require("ui/widget/textboxwidget")
+    local screen_min = math.min(Screen:getWidth(), Screen:getHeight())
+    local qr_size = math.floor(screen_min * 0.66)
+    self.width = self.width or math.floor(screen_min * 0.86)
+
+    local titlebar = TitleBar:new{
+        width = self.width,
+        title = self.title_text,
+        with_bottom_line = true,
+        close_callback = self.close_callback,
+    }
+
+    local qr = QRWidget:new{
+        text = self.qr_text,
+        width = qr_size,
+        height = qr_size,
+    }
+
+    local hint = FrameContainer:new{
+        padding = Size.padding.large,
+        bordersize = 0,
+        TextBoxWidget:new{
+            text = self.hint_text or "",
+            face = Font:getFace("cfont", 16),
+            width = self.width - 2 * Size.padding.large,
+            alignment = "center",
+        },
+    }
+
+    local button_table = ButtonTable:new{
+        width = self.width,
+        buttons = self.buttons,
+        show_parent = self,
+        zero_sep = true,
+    }
+
+    local frame = FrameContainer:new{
+        radius = Size.radius.window,
+        padding = 0,
+        margin = 0,
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.window,
+        VerticalGroup:new{
+            align = "center",
+            titlebar,
+            CenterContainer:new{
+                dimen = Geom:new{ w = self.width, h = qr:getSize().h },
+                qr,
+            },
+            CenterContainer:new{
+                dimen = Geom:new{ w = self.width, h = hint:getSize().h },
+                hint,
+            },
+            CenterContainer:new{
+                dimen = Geom:new{ w = self.width, h = button_table:getSize().h },
+                button_table,
+            },
+        },
+    }
+
+    local movable = MovableContainer:new{ frame }
+    self[1] = CenterContainer:new{
+        dimen = Geom:new{ w = Screen:getWidth(), h = Screen:getHeight() },
+        movable,
+    }
+end
+
+function GoogleQRViewer:onShow()
+    UIManager:setDirty(self, function()
+        return "ui", self[1][1].dimen
+    end)
+    return true
+end
+
+function GoogleQRViewer:paintTo(...)
+    InputContainer.paintTo(self, ...)
+    self.dimen = self[1][1].dimen
+end
+
+function GoogleQRViewer:onCloseWidget()
+    if self.on_close_callback then self.on_close_callback() end
+    UIManager:setDirty(nil, function()
+        return "ui", self[1][1].dimen
+    end)
+end
+
+function GoogleQRViewer:onClose()
+    UIManager:close(self)
+    return true
+end
+
+-- Friendly phone-assisted Google sign-in: show a QR, poll the rendezvous table
+-- until the phone delivers the auth code, then finish the PKCE exchange.
+function DictSync:showGoogleQRSignIn()
+    NetworkMgr:runWhenOnline(function()
+        Trapper:wrap(function()
+            math.randomseed(os.time() + math.floor(os.clock() * 1000000))
+            local device_id = random_verifier(32)
+            local relay = self:getOAuthRelayUrl() .. "?device=" .. self:urlEncode(device_id)
+            local auth_url = self:buildGoogleAuthUrl(relay)
+
+            local viewer
+            local stopped = false
+            local poll
+            local deadline = os.time() + 300
+
+            local function haltPoll()
+                stopped = true
+                UIManager:unschedule(poll)
+            end
+            local function closeViewer()
+                if viewer then
+                    local v = viewer
+                    viewer = nil
+                    UIManager:close(v)
+                end
+            end
+
+            poll = function()
+                if stopped then return end
+                local code = self:pollDeviceLink(device_id)
+                if code then
+                    closeViewer()  -- triggers onCloseWidget -> haltPoll
+                    local ok, err = self:exchangeCodeForSession(code)
+                    self:deleteDeviceLink(device_id)
+                    UIManager:show(InfoMessage:new{
+                        text = ok
+                            and ("Signed in as " .. (self.settings:readSetting("auth_user_email") or "your account"))
+                            or ("Google sign-in failed: " .. tostring(err)),
+                    })
+                    if ok then self:refreshConfigDialog() end
+                    return
+                end
+                if os.time() >= deadline then
+                    closeViewer()
+                    UIManager:show(InfoMessage:new{ text = "Sign-in timed out. Please try again." })
+                    return
+                end
+                UIManager:scheduleIn(2, poll)
+            end
+
+            viewer = GoogleQRViewer:new{
+                qr_text = auth_url,
+                hint_text = "Scan with your phone and sign in with Google.\n"
+                    .. "Your reader will sign in automatically — just wait.",
+                on_close_callback = haltPoll,
+                close_callback = function() closeViewer() end,
+                buttons = {
+                    {
+                        { text = "Cancel", callback = function() closeViewer() end },
+                        { text = "Enter code manually", callback = function()
+                            closeViewer()
+                            self:doGoogleManualEntry()
+                        end },
+                    },
+                },
+            }
+            UIManager:show(viewer)
+            UIManager:scheduleIn(2, poll)
+        end)
+    end)
+end
+
+-- Fallback manual-paste Google sign-in (also covers devices without a camera or a
+-- KOReader build lacking QRWidget). Reachable from the QR dialog.
+function DictSync:doGoogleManualEntry()
+    local url = self:buildGoogleAuthUrl()
+    local code_dialog
+    code_dialog = InputDialog:new{
+        title = "Sign in with Google",
+        input = "",
+        input_type = "text",
+        description = "1. Open this URL in a browser and sign in:\n\n" .. url
+            .. "\n\n2. After approving you'll land on a blank/\"can't connect\""
+            .. " page — that's expected. Copy the FULL address-bar URL"
+            .. "\n(it contains code=...) and paste it below.",
+        buttons = {
+            {
+                {
+                    text = "Cancel",
+                    callback = function() UIManager:close(code_dialog) end,
+                },
+                {
+                    text = "Submit code",
+                    callback = function()
+                        local code = code_dialog:getInputText()
+                        UIManager:close(code_dialog)
+                        NetworkMgr:runWhenOnline(function()
+                            Trapper:wrap(function()
+                                local ok, err = self:exchangeCodeForSession(code)
+                                UIManager:show(InfoMessage:new{
+                                    text = ok and "Signed in with Google"
+                                        or ("Google sign-in failed: " .. tostring(err)),
+                                })
+                                if ok then self:refreshConfigDialog() end
+                            end)
+                        end)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(code_dialog)
+    code_dialog:onShowKeyboard()
+end
+
+-- Close and reopen the config dialog (if any) so it reflects new auth state.
+function DictSync:refreshConfigDialog()
+    if self.config_dialog then
+        UIManager:close(self.config_dialog)
+        self.config_dialog = nil
+    end
+    UIManager:nextTick(function() self:showConfigDialog() end)
+end
+
 -- Load .env file if it exists
 function DictSync:loadEnvFile()
     local DataStorage = require("datastorage")
     local T = require("ffi/util").template
-    local PLUGIN_DIR = T("%1/plugins/dictionary-sync.koplugin/", DataStorage:getDataDir())
+    local PLUGIN_DIR = T("%1/plugins/lingueez.koplugin/", DataStorage:getDataDir())
     local ENV_FILE_PATH = PLUGIN_DIR .. ".env"
     
     local lfs = require("libs/libkoreader-lfs")
     if lfs.attributes(ENV_FILE_PATH, "mode") == "file" then
-        logger.info("Dictionary Sync: Found .env file, loading...")
+        logger.info("Lingueez: Found .env file, loading...")
         local file = io.open(ENV_FILE_PATH, "r")
         if file then
             for line in file:lines() do
@@ -1812,32 +2433,36 @@ function DictSync:loadEnvFile()
                         if key == "SUPABASE_URL" then
                             if not self.settings:has("supabase_url") or self.settings:readSetting("supabase_url") == "" then
                                 self.settings:saveSetting("supabase_url", value)
-                                logger.info("Dictionary Sync: Loaded SUPABASE_URL from .env")
+                                logger.info("Lingueez: Loaded SUPABASE_URL from .env")
                             end
                         elseif key == "SUPABASE_KEY" then
                             if not self.settings:has("supabase_key") or self.settings:readSetting("supabase_key") == "" then
                                 self.settings:saveSetting("supabase_key", value)
-                                logger.info("Dictionary Sync: Loaded SUPABASE_KEY from .env")
+                                logger.info("Lingueez: Loaded SUPABASE_KEY from .env")
                             end
                         elseif key == "DEEPL_API_KEY" then
                             if not self.settings:has("deepl_api_key") or self.settings:readSetting("deepl_api_key") == "" then
                                 self.settings:saveSetting("deepl_api_key", value)
-                                logger.info("Dictionary Sync: Loaded DEEPL_API_KEY from .env")
+                                logger.info("Lingueez: Loaded DEEPL_API_KEY from .env")
                             end
                         elseif key == "DEEPL_USE_PAID_API" then
                             local use_paid = (value:lower() == "true" or value:lower() == "1" or value:lower() == "yes")
                             self.settings:saveSetting("deepl_use_paid_api", use_paid)
-                            logger.info("Dictionary Sync: Loaded DEEPL_USE_PAID_API from .env: " .. tostring(use_paid))
+                            logger.info("Lingueez: Loaded DEEPL_USE_PAID_API from .env: " .. tostring(use_paid))
+                        elseif key == "SHOW_ADVANCED" then
+                            local show_advanced = (value:lower() == "true" or value:lower() == "1" or value:lower() == "yes")
+                            self.settings:saveSetting("show_advanced", show_advanced)
+                            logger.info("Lingueez: Loaded SHOW_ADVANCED from .env: " .. tostring(show_advanced))
                         end
                     end
                 end
             end
             file:close()
             self.settings:flush()
-            logger.info("Dictionary Sync: .env file loaded successfully")
+            logger.info("Lingueez: .env file loaded successfully")
         end
     else
-        logger.info("Dictionary Sync: No .env file found at " .. ENV_FILE_PATH)
+        logger.info("Lingueez: No .env file found at " .. ENV_FILE_PATH)
     end
 end
 
@@ -1886,7 +2511,7 @@ function DictSync:showConfigDialog()
                                 end
                             end)
                             if not success then
-                                logger.err("Dictionary Sync: Error saving Supabase URL: " .. tostring(result))
+                                logger.err("Lingueez: Error saving Supabase URL: " .. tostring(result))
                                 UIManager:show(InfoMessage:new{
                                     text = "Error saving URL: " .. tostring(result),
                                 })
@@ -1934,7 +2559,7 @@ function DictSync:showConfigDialog()
                                 end
                             end)
                             if not success then
-                                logger.err("Dictionary Sync: Error saving Supabase API key: " .. tostring(result))
+                                logger.err("Lingueez: Error saving Supabase API key: " .. tostring(result))
                                 UIManager:show(InfoMessage:new{
                                     text = "Error saving API key: " .. tostring(result),
                                 })
@@ -1949,15 +2574,9 @@ function DictSync:showConfigDialog()
     end
     
     local function testConnection()
-        local supabase_url = self.settings:readSetting("supabase_url")
-        local supabase_key = self.settings:readSetting("supabase_key")
-        
-        if not supabase_url or not supabase_key then
-            UIManager:show(InfoMessage:new{
-                text = "Please configure Supabase URL and API key first",
-            })
-            return
-        end
+        local supabase_url = self:getSupabaseUrl()
+        local supabase_key = self:getSupabaseKey()
+        local supabase_bearer = self:getBearerToken()
         
         -- Show loading message
         UIManager:show(InfoMessage:new{
@@ -1983,7 +2602,7 @@ function DictSync:showConfigDialog()
                         method = "GET",
                         headers = {
                             ["apikey"] = supabase_key,
-                            ["Authorization"] = "Bearer " .. supabase_key,
+                            ["Authorization"] = supabase_bearer,
                             ["Content-Type"] = "application/json",
                         },
                         sink = ltn12.sink.table(response_body),
@@ -2290,74 +2909,140 @@ function DictSync:showConfigDialog()
     end
     
     local config_dialog
+
+    -- Close and reopen the config dialog so its buttons reflect new auth/mode state.
+    local function refreshConfig()
+        if self.config_dialog then
+            UIManager:close(self.config_dialog)
+            self.config_dialog = nil
+        end
+        UIManager:nextTick(function() self:showConfigDialog() end)
+    end
+
+    local function showLoginDialog()
+        local MultiInputDialog = require("ui/widget/multiinputdialog")
+        local login_dialog
+        login_dialog = MultiInputDialog:new{
+            title = "Sign in",
+            fields = {
+                { description = "Email", input_type = "text", hint = "you@example.com" },
+                { description = "Password", input_type = "text", text_type = "password" },
+            },
+            buttons = {
+                {
+                    {
+                        text = "Cancel",
+                        callback = function() UIManager:close(login_dialog) end,
+                    },
+                    {
+                        text = "Sign in",
+                        callback = function()
+                            local fields = login_dialog:getFields()
+                            local email, password = fields[1], fields[2]
+                            UIManager:close(login_dialog)
+                            NetworkMgr:runWhenOnline(function()
+                                Trapper:wrap(function()
+                                    local ok, err = self:signInWithPassword(email, password)
+                                    UIManager:show(InfoMessage:new{
+                                        text = ok
+                                            and ("Signed in as " .. (self.settings:readSetting("auth_user_email") or email))
+                                            or ("Sign-in failed: " .. tostring(err)),
+                                    })
+                                    if ok then refreshConfig() end
+                                end)
+                            end)
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(login_dialog)
+        login_dialog:onShowKeyboard()
+    end
+
+    local function doSignOut()
+        Trapper:wrap(function()
+            self:signOut()
+            UIManager:show(InfoMessage:new{ text = "Signed out" })
+            refreshConfig()
+        end)
+    end
+
+    local function disconnectCustomServer()
+        self.settings:delSetting("supabase_url")
+        self.settings:delSetting("supabase_key")
+        self.settings:flush()
+        UIManager:show(InfoMessage:new{ text = "Reconnected to the built-in server" })
+        refreshConfig()
+    end
+
+    -- Build the button rows dynamically. The Account section shows on the built-in
+    -- server; the extra server fields stay hidden unless show_advanced is set.
+    local is_custom = self:isCustomServer()
+    local show_advanced = self.settings:readSetting("show_advanced") or is_custom
+    local logged_in = (self.settings:readSetting("auth_access_token") or "") ~= ""
+
+    local buttons = {}
+
+    if not is_custom then
+        if logged_in then
+            local email = self.settings:readSetting("auth_user_email") or "(account)"
+            table.insert(buttons, {
+                { text = "Signed in: " .. email, callback = function()
+                    UIManager:show(InfoMessage:new{ text = "Signed in as " .. email })
+                end },
+            })
+            table.insert(buttons, {{ text = "Sign out", callback = doSignOut }})
+        else
+            table.insert(buttons, {
+                { text = "Sign in (email)", callback = showLoginDialog },
+                { text = "Sign in with Google", callback = function() self:showGoogleQRSignIn() end },
+            })
+        end
+        table.insert(buttons, {})  -- separator
+    end
+
+    if show_advanced then
+        table.insert(buttons, {
+            { text = "Set Supabase URL", callback = showUrlDialog },
+            { text = "Set API Key", callback = showKeyDialog },
+        })
+        table.insert(buttons, {{ text = "Test Supabase Connection", callback = testConnection }})
+        if is_custom then
+            table.insert(buttons, {
+                { text = "Disconnect — use built-in server", callback = disconnectCustomServer },
+            })
+        end
+    else
+        table.insert(buttons, {{ text = "Test Supabase Connection", callback = testConnection }})
+    end
+    table.insert(buttons, {})  -- separator
+
+    -- DeepL section
+    table.insert(buttons, {
+        { text = "Set DeepL API Key", callback = showDeepLKeyDialog },
+        { text = "Set DeepL API Type", callback = showDeepLTypeDialog },
+    })
+    table.insert(buttons, {{ text = "Test DeepL API", callback = testDeepLConnection }})
+    -- Language section
+    table.insert(buttons, {
+        { text = "Set Source Language", callback = showSourceLanguageDialog },
+        { text = "Set Target Language", callback = showTargetLanguageDialog },
+    })
+    -- Options
+    table.insert(buttons, {{ text = toggle_button_text, callback = toggleGoogleForce }})
+    table.insert(buttons, {})  -- separator
+    -- Close
+    table.insert(buttons, {
+        { text = "Close", callback = function()
+            UIManager:close(config_dialog)
+            self.config_dialog = nil
+        end },
+    })
+
     config_dialog = ButtonDialog:new{
-        title = "Dictionary Sync Configuration",
-        buttons = {
-            -- Supabase Settings Section
-            {
-                {
-                    text = "Set Supabase URL",
-                    callback = showUrlDialog,
-                },
-                {
-                    text = "Set API Key",
-                    callback = showKeyDialog,
-                },
-            },
-            {
-                {
-                    text = "Test Supabase Connection",
-                    callback = testConnection,
-                },
-            },
-            {},  -- Empty row for visual separation
-            -- DeepL Settings Section
-            {
-                {
-                    text = "Set DeepL API Key",
-                    callback = showDeepLKeyDialog,
-                },
-                {
-                    text = "Set DeepL API Type",
-                    callback = showDeepLTypeDialog,
-                },
-            },
-            {
-                {
-                    text = "Test DeepL API",
-                    callback = testDeepLConnection,
-                },
-            },
-            -- Language Settings Section
-            {
-                {
-                    text = "Set Source Language",
-                    callback = showSourceLanguageDialog,
-                },
-                {
-                    text = "Set Target Language",
-                    callback = showTargetLanguageDialog,
-                },
-            },
-            -- Options Section
-            {
-                {
-                    text = toggle_button_text,
-                    callback = toggleGoogleForce,
-                },
-            },
-            {},  -- Empty row for visual separation
-            -- Close Button
-            {
-                {
-                    text = "Close",
-                    callback = function()
-                        UIManager:close(config_dialog)
-                        self.config_dialog = nil
-                    end,
-                },
-            },
-        },
+        title = "Lingueez Configuration",
+        buttons = buttons,
     }
     -- Store reference to prevent multiple dialogs
     self.config_dialog = config_dialog
@@ -2374,8 +3059,8 @@ function DictSync:showQuickSaveDialog(word1, language1, word2, language2, actual
     language2 = language2 or "[Not set]"
     -- actual_lang_to_save is the language to actually save (nil if we couldn't detect)
     -- Log what we received
-    logger.dbg("Dictionary Sync: showQuickSaveDialog - actual_lang_to_save param: " .. (actual_lang_to_save or "nil"))
-    logger.dbg("Dictionary Sync: showQuickSaveDialog - language1 (display): " .. (language1 or "nil"))
+    logger.dbg("Lingueez: showQuickSaveDialog - actual_lang_to_save param: " .. (actual_lang_to_save or "nil"))
+    logger.dbg("Lingueez: showQuickSaveDialog - language1 (display): " .. (language1 or "nil"))
     
     -- If nil, try to extract from display language or use a fallback
     if not actual_lang_to_save or actual_lang_to_save == "" then
@@ -2384,17 +3069,17 @@ function DictSync:showQuickSaveDialog(word1, language1, word2, language2, actual
             local extracted = language1:match("^([^(]+)")
             if extracted then
                 actual_lang_to_save = extracted:match("^%s*(.-)%s*$")  -- trim
-                logger.dbg("Dictionary Sync: Extracted language from display: " .. actual_lang_to_save)
+                logger.dbg("Lingueez: Extracted language from display: " .. actual_lang_to_save)
             end
         end
         -- If still nil, log warning but don't default to English yet - let the save callback handle it
         if not actual_lang_to_save or actual_lang_to_save == "" then
-            logger.warn("Dictionary Sync: actual_lang_to_save is still nil after extraction attempt")
+            logger.warn("Lingueez: actual_lang_to_save is still nil after extraction attempt")
         end
     end
     
     -- Log for debugging (can be removed later if not needed)
-    logger.dbg("Dictionary Sync: Quick save dialog - word: " .. word1 .. ", display lang: " .. language1 .. ", save lang: " .. (actual_lang_to_save or "nil") .. ", translation: " .. (word2 or ""))
+    logger.dbg("Lingueez: Quick save dialog - word: " .. word1 .. ", display lang: " .. language1 .. ", save lang: " .. (actual_lang_to_save or "nil") .. ", translation: " .. (word2 or ""))
     
     -- Build description text: languages on first line (subtle), word on second line (prominent with diamond style)
     local languages_text = string.format("%s to %s", language1, language2)
@@ -2403,7 +3088,7 @@ function DictSync:showQuickSaveDialog(word1, language1, word2, language2, actual
     -- Use InputDialog with formatted description
     local quick_dialog
     quick_dialog = InputDialog:new{
-        title = "Save to Dictionary",
+        title = "Save to Lingueez",
         description = description,
         input = word2 or "",  -- Translation in input field for editing
         input_type = "text",
@@ -2431,7 +3116,7 @@ function DictSync:showQuickSaveDialog(word1, language1, word2, language2, actual
                                 end
                                 -- If still not found, log error but use English as last resort
                                 if not lang_to_save or lang_to_save == "" then
-                                    logger.warn("Dictionary Sync: Could not determine language for saving, using English as fallback")
+                                    logger.warn("Lingueez: Could not determine language for saving, using English as fallback")
                                     lang_to_save = "English"
                                 end
                             end
@@ -2679,6 +3364,7 @@ function DictSync:handleWordSelection(selected_text)
     if not selected_text or selected_text == "" then
         return
     end
+    if not self:ensureAuthed() then return end
     
     -- Get source language (from settings or auto-detect)
     -- If nil, translateWord will use "auto" for auto-detection
@@ -2702,26 +3388,26 @@ function DictSync:handleWordSelection(selected_text)
                 -- Try multiple ways to get language
                 if props.language then
                     detected_from_doc = self:mapLanguageCode(props.language)
-                    logger.dbg("Dictionary Sync: Found language in props.language: " .. tostring(props.language) .. " -> " .. (detected_from_doc or "nil"))
+                    logger.dbg("Lingueez: Found language in props.language: " .. tostring(props.language) .. " -> " .. (detected_from_doc or "nil"))
                 end
                 -- Also try lang property (some documents use this)
                 if not detected_from_doc and props.lang then
                     detected_from_doc = self:mapLanguageCode(props.lang)
-                    logger.dbg("Dictionary Sync: Found language in props.lang: " .. tostring(props.lang) .. " -> " .. (detected_from_doc or "nil"))
+                    logger.dbg("Lingueez: Found language in props.lang: " .. tostring(props.lang) .. " -> " .. (detected_from_doc or "nil"))
                 end
                 -- Try to get from document info
                 if not detected_from_doc and document.getDocumentInfo then
                     local success, doc_info = pcall(function() return document:getDocumentInfo() end)
                     if success and doc_info and doc_info.language then
                         detected_from_doc = self:mapLanguageCode(doc_info.language)
-                        logger.dbg("Dictionary Sync: Found language in doc_info.language: " .. tostring(doc_info.language) .. " -> " .. (detected_from_doc or "nil"))
+                        logger.dbg("Lingueez: Found language in doc_info.language: " .. tostring(doc_info.language) .. " -> " .. (detected_from_doc or "nil"))
                     end
                 end
             else
-                logger.dbg("Dictionary Sync: document:getProps() returned nil or no props")
+                logger.dbg("Lingueez: document:getProps() returned nil or no props")
             end
         else
-            logger.dbg("Dictionary Sync: No UI or document available for language detection")
+            logger.dbg("Lingueez: No UI or document available for language detection")
         end
         
         -- If still not detected, try to detect from word characters
@@ -2751,24 +3437,24 @@ function DictSync:handleWordSelection(selected_text)
             
             if has_greek then
                 detected_from_doc = "Greek"
-                logger.dbg("Dictionary Sync: Detected Greek from word characters")
+                logger.dbg("Lingueez: Detected Greek from word characters")
             end
         end
         
         -- Log what we detected for debugging
-        logger.dbg("Dictionary Sync: Auto-detect - final detected_from_doc: " .. (detected_from_doc or "nil"))
-        logger.dbg("Dictionary Sync: Selected text: " .. selected_text)
+        logger.dbg("Lingueez: Auto-detect - final detected_from_doc: " .. (detected_from_doc or "nil"))
+        logger.dbg("Lingueez: Selected text: " .. selected_text)
         
         if detected_from_doc then
             -- Show detected language with (Auto-detect) indicator
             display_source_lang = string.format("%s (Auto-detect)", detected_from_doc)
             actual_lang_to_save = detected_from_doc  -- Use detected language for saving
-            logger.info("Dictionary Sync: Using detected language: " .. detected_from_doc .. " for display and saving")
+            logger.info("Lingueez: Using detected language: " .. detected_from_doc .. " for display and saving")
         else
             -- Can't detect, just show Auto-detect
             display_source_lang = "Auto-detect"
             actual_lang_to_save = nil
-            logger.warn("Dictionary Sync: Could not detect language from document or word characters for: " .. selected_text)
+            logger.warn("Lingueez: Could not detect language from document or word characters for: " .. selected_text)
         end
     else
         -- Language is explicitly set, use it as-is
@@ -3416,7 +4102,7 @@ function DictSync:showWordDetailDialog(word_data, on_update_callback)
     -- Fetch tags for this word
     local word_tags, tag_error = self:getWordTags(word_id)
     if tag_error then
-        logger.warn("Dictionary Sync: Could not fetch tags: " .. tag_error)
+        logger.warn("Lingueez: Could not fetch tags: " .. tag_error)
         word_tags = {}
     end
     
@@ -3822,9 +4508,10 @@ function WordsListViewer:onClose()
 end
 
 function DictSync:showWordsListDialog(page, filters)
+    if not self:ensureAuthed() then return end
     page = page or 1
     filters = filters or self.words_filters or {}
-    
+
     if self.filter_dialog then
         self:dismissWordsFilterDialog()
     end
@@ -3883,7 +4570,7 @@ function DictSync:showWordsListDialog(page, filters)
                         )
                         table.insert(word_lines, line)
                     else
-                        logger.warn("Dictionary Sync: Word entry is not a table: " .. tostring(word))
+                        logger.warn("Lingueez: Word entry is not a table: " .. tostring(word))
                     end
                 end
                 
@@ -3898,7 +4585,7 @@ function DictSync:showWordsListDialog(page, filters)
                 
                 -- Safety check: ensure we're not accidentally displaying raw JSON
                 if word_text:match("^{") or word_text:match("%[%s*{") then
-                    logger.err("Dictionary Sync: Detected JSON in word_text, this should not happen!")
+                    logger.err("Lingueez: Detected JSON in word_text, this should not happen!")
                     UIManager:show(InfoMessage:new{
                         text = "Error: Invalid data format. Please check logs.",
                     })
@@ -4243,6 +4930,7 @@ function FlashcardViewer:setCardText(text)
 end
 
 function DictSync:showFlashcardsLauncher()
+    if not self:ensureAuthed() then return end
     local filters = cloneFilters(self.words_filters)
     local summary_text = summarizeFilters(filters)
     local launcher_dialog
@@ -4829,6 +5517,7 @@ end
 
 -- Save the current chapter to Supabase (menu action).
 function DictSync:handleSaveCurrentChapter()
+    if not self:ensureAuthed() then return end
     if not (self.ui and self.ui.document) then
         UIManager:show(InfoMessage:new{ text = "Open a book first." })
         return
@@ -4867,6 +5556,7 @@ end
 
 -- Export every cloud text to the export folder (menu action).
 function DictSync:handleExportAllCloudTexts()
+    if not self:ensureAuthed() then return end
     UIManager:show(InfoMessage:new{ text = "Exporting cloud texts…", timeout = 1 })
 
     NetworkMgr:runWhenOnline(function()
@@ -4891,6 +5581,7 @@ end
 
 -- Browse cloud texts in a list; tapping a row exports that text to a file.
 function DictSync:showTextsListDialog(page)
+    if not self:ensureAuthed() then return end
     page = page or 1
 
     UIManager:show(InfoMessage:new{ text = "Loading texts…", timeout = 1 })
@@ -5004,11 +5695,24 @@ end
 
 -- Add to main menu
 function DictSync:addToMainMenu(menu_items)
-    logger.info("Dictionary Sync: addToMainMenu called")
-    menu_items.dictionary_sync = {
-        text = "Dictionary Sync",
+    logger.info("Lingueez: addToMainMenu called")
+    menu_items.lingueez = {
+        text = "Lingueez",
         sorting_hint = "tools",
         sub_item_table = {
+            {
+                text_func = function()
+                    if self:isCustomServer() then
+                        return "Account: custom server"
+                    elseif self:isAuthed() then
+                        return "Account: " .. (self.settings:readSetting("auth_user_email") or "signed in")
+                    end
+                    return "Account: sign in"
+                end,
+                callback = function()
+                    self:showConfigDialog()
+                end,
+            },
             {
                 text = "Configure",
                 callback = function()
@@ -5065,7 +5769,7 @@ function DictSync:addToMainMenu(menu_items)
                 callback = function()
                     local meta = self.meta or {}
                     UIManager:show(InfoMessage:new{
-                        text = (meta.fullname or "Dictionary Sync")
+                        text = (meta.fullname or "Lingueez")
                             .. "\n\nVersion " .. (meta.version or "?")
                             .. "  ·  Build " .. (meta.build or "?"),
                     })
@@ -5077,54 +5781,54 @@ end
 
 -- Hook into word selection/highlight dialog
 function DictSync:init()
-    logger.info("Dictionary Sync: init() called")
+    logger.info("Lingueez: init() called")
     
     -- Load our own _meta.lua
-    -- The folder name is dictionary-sync.koplugin (with hyphen), not dictionary_sync
+    -- The folder name is lingueez.koplugin; the internal plugin id is "lingueez"
     local DataStorage = require("datastorage")
     local T = require("ffi/util").template
-    
-    -- Try the folder name with hyphen (actual folder name)
-    local PLUGIN_DIR = T("%1/plugins/dictionary-sync.koplugin/", DataStorage:getDataDir())
+
+    -- Try the actual folder name first
+    local PLUGIN_DIR = T("%1/plugins/lingueez.koplugin/", DataStorage:getDataDir())
     local META_FILE_PATH = PLUGIN_DIR .. "_meta.lua"
     
-    logger.info("Dictionary Sync: Looking for _meta.lua at: " .. META_FILE_PATH)
+    logger.info("Lingueez: Looking for _meta.lua at: " .. META_FILE_PATH)
     
     local ok, meta = pcall(dofile, META_FILE_PATH)
     if ok and meta then
         self.meta = meta
-        logger.info("Dictionary Sync: _meta.lua loaded successfully")
+        logger.info("Lingueez: _meta.lua loaded successfully")
     else
-        -- Fallback: try with underscore (in case folder was renamed)
+        -- Fallback: derive from the plugin id (in case the folder was renamed)
         local alt_path = T("%1/plugins/%2.koplugin/_meta.lua", DataStorage:getDataDir(), self.name)
-        logger.info("Dictionary Sync: Trying alternative path: " .. alt_path)
+        logger.info("Lingueez: Trying alternative path: " .. alt_path)
         local ok2, meta2 = pcall(dofile, alt_path)
         if ok2 and meta2 then
             self.meta = meta2
-            logger.info("Dictionary Sync: _meta.lua loaded from alternative path")
+            logger.info("Lingueez: _meta.lua loaded from alternative path")
         else
             -- Last resort: use default meta
-            logger.warn("Dictionary Sync: Failed to load _meta.lua from: " .. META_FILE_PATH .. " and " .. alt_path)
-            logger.warn("Dictionary Sync: Error: " .. tostring(meta or meta2))
+            logger.warn("Lingueez: Failed to load _meta.lua from: " .. META_FILE_PATH .. " and " .. alt_path)
+            logger.warn("Lingueez: Error: " .. tostring(meta or meta2))
             self.meta = {
-                name = "dictionary_sync",
-                fullname = "Dictionary Sync",
-                description = "Save words to Supabase dictionary database",
+                name = "lingueez",
+                fullname = "Lingueez",
+                description = "Save words to your Lingueez vocabulary with automatic translation",
                 version = "1.0.0",
             }
-            logger.info("Dictionary Sync: Using default meta")
+            logger.info("Lingueez: Using default meta")
         end
     end
     
     -- Check if we're in a document context
     if not self.ui then
-        logger.warn("Dictionary Sync: No UI context available")
+        logger.warn("Lingueez: No UI context available")
         return
     end
     
     -- Init settings
     self.settings = LuaSettings:open(self.settings_file)
-    logger.info("Dictionary Sync: Settings initialized")
+    logger.info("Lingueez: Settings initialized")
     
     -- Load .env file if it exists (do this early so credentials are available)
     self:loadEnvFile()
@@ -5133,21 +5837,21 @@ function DictSync:init()
     -- Make our menu appear in tools section
     local menu_order = require("ui/elements/reader_menu_order")
     if menu_order and menu_order.tools then
-        table.insert(menu_order.tools, 1, "dictionary_sync")
+        table.insert(menu_order.tools, 1, "lingueez")
     end
     
     if self.ui.menu then
         self.ui.menu:registerToMainMenu(self) -- then self:addToMainMenu will be called
-        logger.info("Dictionary Sync: Menu registered")
+        logger.info("Lingueez: Menu registered")
     else
-        logger.warn("Dictionary Sync: No menu available")
+        logger.warn("Lingueez: No menu available")
     end
     
     -- Add button to highlight dialog (word selection popup)
     if self.ui.highlight then
-        self.ui.highlight:addToHighlightDialog("dictionary_sync", function(_reader_highlight_instance)
+        self.ui.highlight:addToHighlightDialog("lingueez", function(_reader_highlight_instance)
             return {
-                text = "Save to Dictionary",
+                text = "Save to Lingueez",
                 callback = function()
                     local selected_text = _reader_highlight_instance.selected_text
                     if selected_text and selected_text.text then
@@ -5160,12 +5864,12 @@ function DictSync:init()
                 end,
             }
         end)
-        logger.info("Dictionary Sync: Highlight dialog button added")
+        logger.info("Lingueez: Highlight dialog button added")
     else
-        logger.warn("Dictionary Sync: No highlight available")
+        logger.warn("Lingueez: No highlight available")
     end
     
-    logger.info("Dictionary Sync plugin initialized successfully")
+    logger.info("Lingueez plugin initialized successfully")
 end
 
 -- Add button to dictionary popup (like assistant plugin)
@@ -5174,12 +5878,12 @@ function DictSync:onDictButtonsReady(dict_popup, dict_buttons)
         return
     end
     
-    -- Add "Save to Dictionary" button to dictionary popup
+    -- Add "Save to Lingueez" button to dictionary popup
     -- Insert as a row (array of buttons) at position 2, like assistant plugin
     local plugin_buttons = {
         {
-            id = "dictionary_sync_save",
-            text = "Save to Dictionary",
+            id = "lingueez_save",
+            text = "Save to Lingueez",
             font_bold = true,
             callback = function()
                 NetworkMgr:runWhenOnline(function()

@@ -1,135 +1,94 @@
-# KOReader Dictionary Sync Plugin
+# Lingueez — KOReader plugin
 
-A KOReader plugin that allows you to quickly save words to your Supabase dictionary database. The plugin integrates with KOReader's built-in translation and dictionary features to automatically detect languages and translate words.
+**[lingueez.app](https://lingueez.app)** &nbsp;·&nbsp; [github.com/lysak-yurii/lingueez](https://github.com/lysak-yurii/lingueez)
+
+Save words straight from your e-reader into your Lingueez vocabulary — translated,
+tagged, and synced to the [desktop](https://github.com/lysak-yurii/lingueez) and [web app](https://lingueez.netlify.app) the moment you look them up.
+
+While you read, long-press a word and tap **Save to Lingueez**: the plugin detects
+the language, translates it, and stores it in your account. By the time you next open
+Lingueez on your computer, in reader or in the web, the word is already there — ready to study.
 
 ## Features
 
-- **Automatic Language Detection**: Automatically detects source language from the document
-- **Quick Save**: Save words with minimal interaction - just select a word and confirm
-- **Manual Edit**: Option to manually adjust languages, translation, and add definitions
-- **Supabase Integration**: Directly saves to your Supabase database
-- **Auto-set Metadata**: Automatically sets status="New" and source="koreader"
+- **Flashcards - Review on the reader** — flip through flashcards and your saved words right where
+  you read.
+- **Quick save while you read** — long-press any word and save it without leaving the book.
+- **Instant translation** — Google Translate built in, with optional DeepL.
+- **Knows the language** — the source language is detected from the book, so there is
+  nothing to pick for each word.
+- **One vocabulary, everywhere** — words sync to the same account as the [Lingueez](https://lingueez.app)
+  desktop and [web app](https://lingueez.netlify.app), kept private to you.
+- **Texts, not just words** — save the chapter you're reading to your
+  Lingueez library to study later with
+  side-by-side translation in the desktop and web app,
+  and download your saved texts back onto your reader.
 
-## Setup
+## Install
 
-### 1. Install the Plugin
+1. Copy the `lingueez.koplugin` folder into your KOReader plugins directory:
+   - **Android** — `/sdcard/koreader/plugins/`
+   - **Linux** — `~/.config/koreader/plugins/`
+   - **Kobo / Kindle / other** — see the KOReader documentation for the plugin path.
+2. Restart KOReader. The plugin appears in **Plugin Management** and adds a
+   **Lingueez** entry to the menu.
 
-1. Copy the `dictionary-sync.koplugin` folder to your KOReader plugins directory:
-   - On Android: `/sdcard/koreader/plugins/`
-   - On Linux: `~/.config/koreader/plugins/`
-   - On other devices: Check KOReader documentation for plugin directory location
+## Sign in
 
-2. Restart KOReader - the plugin should appear in the plugin management
+There is nothing to configure — the plugin connects to Lingueez and you simply sign in
+with your account.
 
-### 2. Configure Supabase Credentials
+1. Open **Menu → Lingueez → Configure**.
+2. Tap **Sign in (email)** and enter your Lingueez email and password, **or** tap
+   **Sign in with Google** for the phone-assisted flow below.
+3. That's it — everything you save is private to your account and shows up in the
+   desktop and web apps.
 
-You have two options:
+> New to Lingueez? Create your account on the [desktop or web app](https://lingueez.app)
+> first — the plugin signs you in, it doesn't register new accounts.
 
-#### Option A: Use .env File (Recommended - Easier on Kindle)
+### Sign in with Google — scan with your phone
 
-1. Copy `.env.example` to `.env` in the plugin folder:
-   ```
-   dictionary-sync.koplugin/.env
-   ```
+Typing on an e-reader is painful, so Google sign-in happens on your phone:
 
-2. Edit `.env` and add your credentials:
-   ```
-   SUPABASE_URL=https://your-project.supabase.co
-   SUPABASE_KEY=your-anon-public-key-here
-   ```
+1. Tap **Sign in with Google** — the reader shows a **QR code**.
+2. **Scan it with your phone** and sign in with Google there, with a real keyboard.
+3. Your phone shows *"Signed in — return to your e-reader"*, and the reader picks it up
+   within a couple of seconds and signs in **automatically**.
 
-3. Restart KOReader - the plugin will automatically load credentials from `.env`
+No phone or camera handy? Tap **Enter code manually** in the QR dialog instead.
 
-#### Option B: Manual Configuration
+## Saving words
 
-1. Open KOReader
-2. Go to **Menu** → **Dictionary Sync** → **Configure**
-3. Enter your Supabase credentials:
-   - **Supabase URL**: Your Supabase project URL (e.g., `https://xxxxx.supabase.co`)
-   - **Supabase API Key**: Your Supabase anon/public key
-4. Click **Test Connection** to verify
-5. Settings are automatically saved
+- **While reading** — long-press a word, tap **Save to Lingueez**, tweak the
+  translation if you like, and save.
+- **From the menu** — select a word, then **Menu → Lingueez → Save Selected
+  Word**.
 
-**Note**: If you use `.env` file, those values take priority. Manual configuration will override `.env` values if you save them.
+Either way the word lands in your dictionary, marked *New*, ready to study in all your Lingueez platforms.
 
-### 3. How to Get Supabase Credentials
+## Translation provider
 
-1. Go to [https://supabase.com](https://supabase.com) and log in
-2. Select your project (or create a new one)
-3. Go to **Settings** → **API**
-4. Copy the **Project URL** and **anon/public key**
-
-## Usage
-
-### Quick Save from Word Selection
-
-1. While reading, select a word by long-pressing or using KOReader's word selection
-2. In the popup menu, tap **"Save to Dictionary"**
-3. A dialog will appear - enter the translation and adjust languages if needed
-4. Click **Save** to save the word
-5. The word will be saved with:
-   - `status` = "New"
-   - `source` = "koreader"
-
-### Manual Save from Menu
-
-1. Select a word in the book
-2. Go to **Menu** → **Dictionary Sync** → **Save Selected Word**
-3. Enter word details and save
-
-## Data Structure
-
-Words are saved to Supabase with the following structure:
-
-- `language1`: Source language (e.g., "English", "German")
-- `word1`: The selected word
-- `language2`: Target/translation language
-- `word2`: The translation
-- `status`: Always set to "New"
-- `source`: Always set to "koreader"
-- `definition`: Optional, can be added manually
-- `definition2`: Optional
-- `favorite`: Defaults to false
+Google Translate works out of the box. To use **DeepL** instead, copy `.env.example`
+to `.env` next to the plugin and add your `DEEPL_API_KEY`.
 
 ## Troubleshooting
 
-### Plugin Not Appearing in Menu
+- **Plugin not in the menu** — enable it in Plugin Management, restart KOReader, and
+  check the files are in the correct `.koplugin` directory.
+- **Can't sign in** — confirm your Lingueez email and password (create the account on
+  the [desktop](https://github.com/lysak-yurii/lingueez) or [web app](https://lingueez.netlify.app) first), check your internet connection, and make sure the
+  device clock is correct.
+- **Word won't save** — it's usually a duplicate (the same word and translation already
+  exist), or there's no connection.
 
-- Ensure the plugin is enabled in Plugin Management
-- Restart KOReader after installation
-- Check that files are in the correct `.koplugin` directory
+## Support
 
-### Cannot Connect to Supabase
-
-- Verify your Supabase URL and API key are correct
-- Check your internet connection
-- Ensure your Supabase project is active
-- Check that Row Level Security (RLS) policies allow your API key to insert data
-
-### Word Not Saving
-
-- Check for duplicate words (same word1/word2 pair already exists)
-- Verify all required fields (language1, word1, language2, word2) are present
-- Check that you have internet connection
-- Verify Supabase credentials are configured
-
-## Requirements
-
-- KOReader with plugin support
-- Supabase account and project
-- Internet connection for saving words
+Having trouble installing or syncing? See [TROUBLESHOOTING.md](TROUBLESHOOTING.md). You can also [open an issue](https://github.com/lysak-yurii/lingueez.koplugin/issues).
 
 ## License
 
-Copyright (C) 2024 Yurii Lysak
-
-This program is free software: you can redistribute it and/or modify it under
-the terms of the GNU Affero General Public License as published by the Free
-Software Foundation, either version 3 of the License, or (at your option) any
-later version. This matches the license of KOReader itself.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
-
-The full license text is available in the [LICENSE](LICENSE) file.
+© 2024 Yurii Lysak. Licensed under the **GNU Affero General Public License v3.0** — you
+may use, study, share, and modify it, and any distributed version (including over a
+network) must remain open under the same license. This matches the license of KOReader
+itself. See the [LICENSE](LICENSE) file for the full text.
