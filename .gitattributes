@@ -1,0 +1,5 @@
+# Files kept in the repo but excluded from the released plugin archive.
+# `git archive` honours export-ignore; the screenshots exist only for the
+# GitHub README and don't belong in the bundle users install.
+screenshots/ export-ignore
+.gitattributes export-ignore
