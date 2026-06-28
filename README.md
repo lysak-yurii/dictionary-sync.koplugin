@@ -3,7 +3,7 @@
 **[lingueez.app](https://lingueez.app)** &nbsp;·&nbsp; [github.com/lysak-yurii/lingueez](https://github.com/lysak-yurii/lingueez)
 
 Save words straight from your e-reader into your Lingueez vocabulary — translated,
-tagged, and synced to the [desktop](https://github.com/lysak-yurii/lingueez) and [web app](https://lingueez.netlify.app) the moment you look them up.
+tagged, and synced to the [desktop](https://github.com/lysak-yurii/lingueez) and [web app](https://web.lingueez.app) the moment you look them up.
 
 While you read, long-press a word and tap **Save to Lingueez**: the plugin detects
 the language, translates it, and stores it in your account. By the time you next open
@@ -20,7 +20,7 @@ Lingueez on your computer, in reader or in the web, the word is already there �
 - **Knows the language** — the source language is detected from the book, so there is
   nothing to pick for each word.
 - **One vocabulary, everywhere** — words sync to the same account as the [Lingueez](https://lingueez.app)
-  desktop and [web app](https://lingueez.netlify.app), kept private to you.
+  desktop and [web app](https://web.lingueez.app), kept private to you.
 - **Texts, not just words** — save the chapter you're reading to your
   Lingueez library to study later with
   side-by-side translation in the desktop and web app,
@@ -80,7 +80,7 @@ to `.env` next to the plugin and add your `DEEPL_API_KEY`.
 - **Plugin not in the menu** — enable it in Plugin Management, restart KOReader, and
   check the files are in the correct `.koplugin` directory.
 - **Can't sign in** — confirm your Lingueez email and password (create the account on
-  the [desktop](https://github.com/lysak-yurii/lingueez) or [web app](https://lingueez.netlify.app) first), check your internet connection, and make sure the
+  the [desktop](https://github.com/lysak-yurii/lingueez) or [web app](https://web.lingueez.app) first), check your internet connection, and make sure the
   device clock is correct.
 - **Word won't save** — it's usually a duplicate (the same word and translation already
   exist), or there's no connection.
